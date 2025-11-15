@@ -19,3 +19,9 @@ dist/
 
 # OS clutter
 .DS_Store
+
+# Tmp files
+.comate
+.serena
+.tmp
+.logs
