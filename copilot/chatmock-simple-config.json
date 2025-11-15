@@ -1,0 +1,42 @@
+{
+  "default": {
+    "host": "127.0.0.1",
+    "port": 8000,
+    "model": "gpt-5.1",
+    "reasoning_effort": "medium",
+    "max_connections": 30,
+    "timeout": 60,
+    "web_search_enabled": false,
+    "description": "默认配置 - 平衡性能和质量"
+  },
+  "fast": {
+    "host": "127.0.0.1",
+    "port": 8001,
+    "model": "gpt-5.1",
+    "reasoning_effort": "low",
+    "max_connections": 50,
+    "timeout": 30,
+    "web_search_enabled": false,
+    "description": "快速响应 - 适合日常代码补全"
+  },
+  "quality": {
+    "host": "127.0.0.1",
+    "port": 8002,
+    "model": "gpt-5.1",
+    "reasoning_effort": "high",
+    "max_connections": 20,
+    "timeout": 120,
+    "web_search_enabled": true,
+    "description": "高质量输出 - 适合复杂任务"
+  },
+  "codex": {
+    "host": "127.0.0.1",
+    "port": 8003,
+    "model": "gpt-5.1-codex",
+    "reasoning_effort": "medium",
+    "max_connections": 30,
+    "timeout": 60,
+    "web_search_enabled": false,
+    "description": "代码专用 - 使用Codex模型"
+  }
+}

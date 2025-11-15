@@ -1,0 +1,141 @@
+{
+  //"oaicopilot.baseUrl": "http://127.0.0.1:8000/v1",
+  "oaicopilot.models": [
+    {
+      "id": "gpt-5.1-codex-mini",
+      "owned_by": "chatmock",
+      "baseUrl": "http://127.0.0.1:8000/v1",
+      "configId": "daily-coding",
+      "displayName": "⚡ Daily Coding",
+      "temperature": 0.1,
+      "top_p": 0.95,
+      "max_tokens": 1024,
+      "reasoning_effort": "low",
+      "frequency_penalty": 0.1,
+      "presence_penalty": 0.1,
+      "context_length": 16000,
+      "extra": {
+        "response_format": {"type": "text"},
+        "stream": true
+      }
+    },
+    {
+      "id": "gpt-5.1-codex",
+      "owned_by": "chatmock",
+      "baseUrl": "http://127.0.0.1:8001/v1",
+      "configId": "complex-implementation",
+      "displayName": "🧠 Complex Implementation",
+      "temperature": 0.2,
+      "top_p": 0.9,
+      "max_tokens": 4096,
+      "reasoning_effort": "medium",
+      "frequency_penalty": 0.3,
+      "presence_penalty": 0.2,
+      "context_length": 64000,
+      "enable_thinking": true,
+      "thinking_budget": 2000,
+      "extra": {
+        "response_format": {"type": "text"},
+        "include_code_comments": true,
+        "performance_optimization": true
+      }
+    },
+    {
+      "id": "gpt-5.1",
+      "owned_by": "chatmock",
+      "baseUrl": "http://127.0.0.1:8002/v1",
+      "configId": "architecture-design",
+      "displayName": "🏗️ Architecture Design",
+      "temperature": 0.3,
+      "top_p": 0.95,
+      "max_tokens": 8192,
+      "reasoning_effort": "high",
+      "frequency_penalty": 0.5,
+      "presence_penalty": 0.4,
+      "context_length": 128000,
+      "enable_thinking": true,
+      "thinking_budget": 4000,
+      "extra": {
+        "response_format": {"type": "text"},
+        "include_diagrams": true,
+        "consider_scalability": true,
+        "security_focused": true,
+        "best_practices": true,
+        "web_search_enabled": true
+      }
+    },
+    {
+      "id": "gpt-5.1",
+      "owned_by": "chatmock",
+      "baseUrl": "http://127.0.0.1:8003/v1",
+      "configId": "documentation",
+      "displayName": "📚 Documentation",
+      "temperature": 0.7,
+      "top_p": 0.9,
+      "max_tokens": 6144,
+      "reasoning_effort": "medium",
+      "frequency_penalty": 0.2,
+      "presence_penalty": 0.3,
+      "context_length": 96000,
+      "enable_thinking": true,
+      "thinking_budget": 3000,
+      "extra": {
+        "response_format": {"type": "text"},
+        "markdown_format": true,
+        "include_examples": true,
+        "user_friendly_language": true,
+        "structured_output": true,
+        "technical_accuracy": true
+      }
+    },
+    {
+      "id": "gpt-5.1-codex",
+      "owned_by": "chatmock",
+      "baseUrl": "http://127.0.0.1:8004/v1",
+      "configId": "debugging",
+      "displayName": "🔍 Debugging Assistant",
+      "temperature": 0.0,
+      "top_p": 1.0,
+      "max_tokens": 3072,
+      "reasoning_effort": "high",
+      "frequency_penalty": 0.0,
+      "presence_penalty": 0.1,
+      "context_length": 48000,
+      "enable_thinking": true,
+      "thinking_budget": 2500,
+      "extra": {
+        "response_format": {"type": "text"},
+        "analytical_mode": true,
+        "step_by_step_reasoning": true,
+        "error_pattern_recognition": true,
+        "solution_focused": true,
+        "performance_analysis": true
+      }
+    },
+    {
+      "id": "gpt-5.1",
+      "owned_by": "chatmock",
+      "baseUrl": "http://127.0.0.1:8005/v1",
+      "configId": "task-planning",
+      "displayName": "📋 Task Planning",
+      "temperature": 0.4,
+      "top_p": 0.9,
+      "max_tokens": 5120,
+      "reasoning_effort": "high",
+      "frequency_penalty": 0.3,
+      "presence_penalty": 0.2,
+      "context_length": 80000,
+      "enable_thinking": true,
+      "thinking_budget": 3500,
+      "extra": {
+        "response_format": {"type": "text"},
+        "structured_planning": true,
+        "timeline_estimation": true,
+        "resource_allocation": true,
+        "risk_assessment": true,
+        "milestone_tracking": true,
+        "dependency_analysis": true
+      }
+    }
+  ]
+}
