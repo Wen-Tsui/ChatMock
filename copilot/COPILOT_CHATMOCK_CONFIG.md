@@ -181,17 +181,13 @@
       "owned_by": "chatmock",
       "configId": "daily-coding",
       "displayName": "⚡ Daily Coding",
-      "temperature": 0.1,
-      "top_p": 0.95,
+      "temperature": 0.02,
+      "top_p": 0.98,
       "max_tokens": 1024,
-      "reasoning_effort": "low",
-      "frequency_penalty": 0.1,
-      "presence_penalty": 0.1,
-      "context_length": 16000,
-      "extra": {
-        "response_format": {"type": "text"},
-        "stream": true
-      }
+      "reasoning_effort": "medium",
+      "frequency_penalty": 0.15,
+      "presence_penalty": 0.08,
+      "context_length": 32000
     }
   ]
 }
@@ -205,7 +201,7 @@
 
 **ChatMock 启动参数**：
 ```bash
-python3 chatmock.py serve --reasoning-effort low
+python3 chatmock.py serve --reasoning-effort medium
 ```
 
 ### 2. 复杂代码实现配置
@@ -222,20 +218,15 @@ python3 chatmock.py serve --reasoning-effort low
       "owned_by": "chatmock",
       "configId": "complex-implementation",
       "displayName": "🧠 Complex Implementation",
-      "temperature": 0.2,
-      "top_p": 0.9,
-      "max_tokens": 4096,
+      "temperature": 0.15,
+      "top_p": 0.92,
+      "max_tokens": 6144,
       "reasoning_effort": "medium",
       "frequency_penalty": 0.3,
       "presence_penalty": 0.2,
-      "context_length": 64000,
+      "context_length": 96000,
       "enable_thinking": true,
-      "thinking_budget": 2000,
-      "extra": {
-        "response_format": {"type": "text"},
-        "include_code_comments": true,
-        "performance_optimization": true
-      }
+      "thinking_budget": 4000
     }
   ]
 }
@@ -267,23 +258,15 @@ python3 chatmock.py serve --reasoning-effort medium --enable-web-search
       "owned_by": "chatmock",
       "configId": "architecture-design",
       "displayName": "🏗️ Architecture Design",
-      "temperature": 0.3,
-      "top_p": 0.95,
-      "max_tokens": 8192,
+      "temperature": 0.28,
+      "top_p": 0.96,
+      "max_tokens": 10240,
       "reasoning_effort": "high",
-      "frequency_penalty": 0.5,
-      "presence_penalty": 0.4,
-      "context_length": 128000,
+      "frequency_penalty": 0.4,
+      "presence_penalty": 0.3,
+      "context_length": 200000,
       "enable_thinking": true,
-      "thinking_budget": 4000,
-      "extra": {
-        "response_format": {"type": "text"},
-        "include_diagrams": true,
-        "consider_scalability": true,
-        "security_focused": true,
-        "best_practices": true,
-        "web_search_enabled": true
-      }
+      "thinking_budget": 8000
     }
   ]
 }
@@ -315,23 +298,14 @@ python3 chatmock.py serve --reasoning-effort high --enable-web-search
       "owned_by": "chatmock",
       "configId": "documentation",
       "displayName": "📚 Documentation",
-      "temperature": 0.7,
-      "top_p": 0.9,
-      "max_tokens": 6144,
+      "temperature": 0.72,
+      "top_p": 0.92,
+      "max_tokens": 8192,
       "reasoning_effort": "medium",
-      "frequency_penalty": 0.2,
-      "presence_penalty": 0.3,
-      "context_length": 96000,
-      "enable_thinking": true,
-      "thinking_budget": 3000,
-      "extra": {
-        "response_format": {"type": "text"},
-        "markdown_format": true,
-        "include_examples": true,
-        "user_friendly_language": true,
-        "structured_output": true,
-        "technical_accuracy": true
-      }
+      "frequency_penalty": 0.25,
+      "presence_penalty": 0.35,
+      "context_length": 128000,
+      "enable_thinking": true
     }
   ]
 }
@@ -364,21 +338,13 @@ python3 chatmock.py serve --reasoning-effort medium --enable-web-search
       "displayName": "?? Debugging Assistant",
       "temperature": 0.0,
       "top_p": 1.0,
-      "max_tokens": 3072,
+      "max_tokens": 5120,
       "reasoning_effort": "high",
       "frequency_penalty": 0.0,
-      "presence_penalty": 0.1,
-      "context_length": 48000,
+      "presence_penalty": 0.05,
+      "context_length": 128000,
       "enable_thinking": true,
-      "thinking_budget": 2500,
-      "extra": {
-        "response_format": {"type": "text"},
-        "analytical_mode": true,
-        "step_by_step_reasoning": true,
-        "error_pattern_recognition": true,
-        "solution_focused": true,
-        "performance_analysis": true
-      }
+      "thinking_budget": 6000
     }
   ]
 }
@@ -409,24 +375,15 @@ python3 chatmock.py serve --reasoning-effort high --enable-web-search
       "owned_by": "chatmock",
       "configId": "task-planning",
       "displayName": "📋 Task Planning",
-      "temperature": 0.4,
-      "top_p": 0.9,
-      "max_tokens": 5120,
+      "temperature": 0.35,
+      "top_p": 0.93,
+      "max_tokens": 7168,
       "reasoning_effort": "high",
       "frequency_penalty": 0.3,
-      "presence_penalty": 0.2,
-      "context_length": 80000,
+      "presence_penalty": 0.25,
+      "context_length": 128000,
       "enable_thinking": true,
-      "thinking_budget": 3500,
-      "extra": {
-        "response_format": {"type": "text"},
-        "structured_planning": true,
-        "timeline_estimation": true,
-        "resource_allocation": true,
-        "risk_assessment": true,
-        "milestone_tracking": true,
-        "dependency_analysis": true
-      }
+      "thinking_budget": 6000
     }
   ]
 }

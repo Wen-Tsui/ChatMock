@@ -170,18 +170,38 @@ start_scene() {
     
     print_info "启动场景: $scene_id"
     
-    # 使用管理脚本启动场景
-    local cmd="$MANAGER_SCRIPT start --scene $scene_id"
+    local log_file="$LOG_DIR/manager-$scene_id.log"
+    local cmd=("$MANAGER_SCRIPT" start --scene "$scene_id")
     
     if [ "$background" = "true" ]; then
-        # 后台启动
-        nohup $cmd > "$LOG_DIR/chatmock-$scene_id.log" 2>&1 &
-        local pid=$!
-        echo $pid > "$SCRIPT_DIR/chatmock-$scene_id.pid"
-        print_success "场景 $scene_id 启动中 (PID: $pid)"
+        if ! "${cmd[@]}" > "$log_file" 2>&1; then
+            print_error "场景 $scene_id 启动失败，详情见 $log_file"
+            return 1
+        fi
     else
-        # 前台启动
-        $cmd
+        if ! "${cmd[@]}"; then
+            print_error "场景 $scene_id 启动失败"
+            return 1
+        fi
+    fi
+    
+    local pid_file="$SCRIPT_DIR/chatmock-$scene_id.pid"
+    local retry=0
+    while [ ! -f "$pid_file" ] && [ $retry -lt 10 ]; do
+        sleep 0.5
+        retry=$((retry + 1))
+    done
+    
+    if [ ! -f "$pid_file" ]; then
+        print_warning "未找到场景 $scene_id 的 PID 文件，请检查日志"
+        return 1
+    fi
+    
+    local pid=$(cat "$pid_file")
+    if kill -0 "$pid" 2>/dev/null; then
+        print_success "场景 $scene_id 启动完成 (PID: $pid)"
+    else
+        print_warning "场景 $scene_id 进程未运行，PID: $pid"
     fi
 }
 
@@ -398,7 +418,7 @@ show_status() {
     
     echo -e "${CYAN}通过此脚本启动的实例:${NC}"
     echo "配置名称\\t\\tPID\\t\\t端口\\t\\t状态"
-    echo "-" * 60
+    printf '%s\n' "------------------------------------------------------------"
     
     for pid_file in "$SCRIPT_DIR"/chatmock-*.pid; do
         if [ -f "$pid_file" ]; then
@@ -409,7 +429,7 @@ show_status() {
             
             if kill -0 $pid 2>/dev/null; then
                 # 尝试获取端口信息
-                port=$(lsof -Pi -p $pid -sTCP:LISTEN -t 2>/dev/null | head -1)
+                port=$(lsof -Pan -p $pid -iTCP -sTCP:LISTEN -F n 2>/dev/null | sed -n 's/^n.*:\([0-9]*\)$/\1/p' | head -1)
                 [ -z "$port" ] && port="N/A"
                 status="运行中"
             else
@@ -466,7 +486,7 @@ test_all() {
                 print_info "测试配置: $config_name"
                 
                 # 获取端口
-                local port=$(lsof -Pi -p $pid -sTCP:LISTEN -t 2>/dev/null | head -1)
+                local port=$(lsof -Pan -p $pid -iTCP -sTCP:LISTEN -F n 2>/dev/null | sed -n 's/^n.*:\([0-9]*\)$/\1/p' | head -1)
                 if [ -n "$port" ]; then
                     # 简单的健康检查
                     if curl -s --max-time 3 "http://127.0.0.1:$port/health" > /dev/null 2>&1; then

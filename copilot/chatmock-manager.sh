@@ -8,13 +8,41 @@ set -e
 # 配置变量
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 LOG_DIR="$SCRIPT_DIR/.logs"
-PID_FILE="$SCRIPT_DIR/chatmock.pid"
-LOG_FILE="$LOG_DIR/chatmock.log"
-ERROR_LOG="$LOG_DIR/chatmock.error.log"
+PID_FILE_BASE="$SCRIPT_DIR/chatmock.pid"
+LOG_FILE_BASE="$LOG_DIR/chatmock.log"
+ERROR_LOG_BASE="$LOG_DIR/chatmock.error.log"
+PID_FILE="$PID_FILE_BASE"
+LOG_FILE="$LOG_FILE_BASE"
+ERROR_LOG="$ERROR_LOG_BASE"
 CONFIG_FILE="$SCRIPT_DIR/chatmock-copilot-config.json"
 SANITIZED_CONFIG_FILE=""
 CONFIG_JSON_PATH="$CONFIG_FILE"
 CODEX_HOME="$HOME/.codex"
+CURRENT_SCENE_FILE="$SCRIPT_DIR/current_scene.txt"
+
+sanitize_scene_name() {
+    local raw="$1"
+    if [ -z "$raw" ]; then
+        echo ""
+        return
+    fi
+    echo "$raw" | sed 's/[^a-zA-Z0-9._-]/_/g'
+}
+
+set_instance_context() {
+    local scene_id="$1"
+    if [ -n "$scene_id" ]; then
+        local safe_scene
+        safe_scene=$(sanitize_scene_name "$scene_id")
+        PID_FILE="$SCRIPT_DIR/chatmock-$safe_scene.pid"
+        LOG_FILE="$LOG_DIR/chatmock-$safe_scene.log"
+        ERROR_LOG="$LOG_DIR/chatmock-$safe_scene.error.log"
+    else
+        PID_FILE="$PID_FILE_BASE"
+        LOG_FILE="$LOG_FILE_BASE"
+        ERROR_LOG="$ERROR_LOG_BASE"
+    fi
+}
 
 cleanup_sanitized_file() {
     if [ -n "$SANITIZED_CONFIG_FILE" ] && [ -f "$SANITIZED_CONFIG_FILE" ]; then
@@ -63,7 +91,7 @@ sanitize_config_file
 
 # 默认配置
 DEFAULT_HOST="127.0.0.1"
-DEFAULT_PORT="8000"
+DEFAULT_PORT="8001"
 DEFAULT_REASONING_EFFORT="medium"
 DEFAULT_MAX_CONNECTIONS="30"
 DEFAULT_TIMEOUT="60"
@@ -117,12 +145,12 @@ check_chatmock() {
         exit 1
     fi
     
-    if [ ! -f "$SCRIPT_DIR/chatmock.py" ]; then
+    if [ ! -f "$SCRIPT_DIR/../chatmock.py" ]; then
         print_error "未找到 chatmock.py 文件，请确保在正确的目录中运行此脚本"
         exit 1
     fi
     
-    if ! python3 -c "import sys; sys.path.append('$SCRIPT_DIR'); import chatmock" 2>/dev/null; then
+    if ! python3 -c "import sys; sys.path.append('$SCRIPT_DIR/..'); import chatmock" 2>/dev/null; then
         print_error "ChatMock 模块导入失败，请检查安装"
         exit 1
     fi
@@ -204,26 +232,30 @@ get_scene_web_search() {
     
     # 检查 extra 字段中的 web_search_enabled
     if [ -z "$web_search" ]; then
-        web_search=$(python3 -c "
-import json
+        web_search=$(python3 - "$CONFIG_JSON_PATH" "$scene_id" <<'PY'
+import json, sys
 
-def get_web_search():
-    try:
-        with open('$CONFIG_JSON_PATH', 'r') as f:
-            config = json.load(f)
-        
-        for model in config.get('oaicopilot.models', []):
-            if model.get('configId') == '$scene_id':
-                extra = model.get('extra', {})
-                web_search = extra.get('web_search_enabled', False)
-                print(str(web_search).lower())
-                return
-        print('false')
-    except:
-        print('false')
+config_path = sys.argv[1]
+scene_id = sys.argv[2]
 
-get_web_search()
-")
+import sys
+
+try:
+    with open(config_path, 'r') as f:
+        config = json.load(f)
+    for model in config.get('oaicopilot.models', []):
+        if model.get('configId') == scene_id:
+            extra = model.get('extra') or {}
+            if isinstance(extra, dict) and 'web_search_enabled' in extra:
+                value = extra.get('web_search_enabled')
+                print(str(bool(value)).lower())
+                sys.exit(0)
+            break
+except Exception:
+    pass
+print('')
+PY
+)
     fi
     
     if [ -z "$web_search" ]; then
@@ -474,6 +506,8 @@ start_chatmock() {
         esac
     done
     
+    set_instance_context "$scene_id"
+
     # 如果指定了场景，从配置文件中获取参数
     if [ -n "$scene_id" ]; then
         print_info "使用场景配置: $scene_id"
@@ -530,7 +564,7 @@ start_chatmock() {
     print_info "错误日志: $ERROR_LOG"
     
     # 构建启动命令 - 只使用ChatMock实际支持的参数
-    local cmd="cd $SCRIPT_DIR && CODEX_HOME=$CODEX_HOME python3 chatmock.py serve"
+    local cmd="cd $SCRIPT_DIR && CODEX_HOME=$CODEX_HOME python3 $SCRIPT_DIR/../chatmock.py serve"
     cmd="$cmd --host $host"
     cmd="$cmd --port $port"
     cmd="$cmd --reasoning-effort $reasoning_effort"
@@ -545,7 +579,9 @@ start_chatmock() {
     
     # 保存 PID 和场景信息
     echo $pid > "$PID_FILE"
-    [ -n "$scene_id" ] && echo "$scene_id" > "$SCRIPT_DIR/current_scene.txt"
+    if [ -n "$scene_id" ]; then
+        echo "$scene_id" > "$CURRENT_SCENE_FILE"
+    fi
     
     # 等待服务启动
     print_info "等待服务启动..."
@@ -568,13 +604,29 @@ start_chatmock() {
         print_error "ChatMock 服务启动失败"
         print_error "请检查错误日志: $ERROR_LOG"
         rm -f "$PID_FILE"
-        rm -f "$SCRIPT_DIR/current_scene.txt"
+        rm -f "$CURRENT_SCENE_FILE"
         exit 1
     fi
 }
 
 # 停止 ChatMock 服务
 stop_chatmock() {
+    local scene_id=""
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --scene|-s)
+                scene_id="$2"
+                shift 2
+                ;;
+            *)
+                shift
+                ;;
+        esac
+    done
+    if [ -z "$scene_id" ] && [ -f "$CURRENT_SCENE_FILE" ]; then
+        scene_id=$(cat "$CURRENT_SCENE_FILE")
+    fi
+    set_instance_context "$scene_id"
     if [ ! -f "$PID_FILE" ]; then
         print_warning "未找到 PID 文件，服务可能未运行"
         return 0
@@ -605,18 +657,40 @@ stop_chatmock() {
     fi
     
     rm -f "$PID_FILE"
-    rm -f "$SCRIPT_DIR/current_scene.txt"
+    if [ -n "$scene_id" ]; then
+        if [ -f "$CURRENT_SCENE_FILE" ] && [ "$(cat "$CURRENT_SCENE_FILE")" = "$scene_id" ]; then
+            rm -f "$CURRENT_SCENE_FILE"
+        fi
+    else
+        rm -f "$CURRENT_SCENE_FILE"
+    fi
 }
 
 # 重启 ChatMock 服务
 restart_chatmock() {
-    stop_chatmock
+    stop_chatmock "$@"
     sleep 2
     start_chatmock "$@"
 }
 
 # 查看服务状态
 status_chatmock() {
+    local scene_id=""
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --scene|-s)
+                scene_id="$2"
+                shift 2
+                ;;
+            *)
+                shift
+                ;;
+        esac
+    done
+    if [ -z "$scene_id" ] && [ -f "$CURRENT_SCENE_FILE" ]; then
+        scene_id=$(cat "$CURRENT_SCENE_FILE")
+    fi
+    set_instance_context "$scene_id"
     print_header "ChatMock 服务状态"
     
     if [ -f "$PID_FILE" ]; then
@@ -625,8 +699,8 @@ status_chatmock() {
             print_success "服务正在运行 (PID: $pid)"
             
             # 显示当前场景信息
-            if [ -f "$SCRIPT_DIR/current_scene.txt" ]; then
-                local current_scene=$(cat "$SCRIPT_DIR/current_scene.txt")
+            if [ -f "$CURRENT_SCENE_FILE" ]; then
+                local current_scene=$(cat "$CURRENT_SCENE_FILE")
                 local display_name=$(get_scene_config "$current_scene" "displayName")
                 print_info "当前场景: $current_scene"
                 [ -n "$display_name" ] && print_info "场景名称: $display_name"
@@ -668,7 +742,7 @@ status_chatmock() {
         else
             print_error "服务未运行 (PID 文件存在但进程不存在)"
             rm -f "$PID_FILE"
-            rm -f "$SCRIPT_DIR/current_scene.txt"
+            rm -f "$CURRENT_SCENE_FILE"
         fi
     else
         print_warning "服务未运行 (无 PID 文件)"
@@ -688,8 +762,30 @@ status_chatmock() {
 
 # 查看日志
 logs_chatmock() {
-    local lines=${1:-50}
-    
+    local lines=50
+    local scene_id=""
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --scene|-s)
+                scene_id="$2"
+                shift 2
+                ;;
+            --lines)
+                lines="$2"
+                shift 2
+                ;;
+            *)
+                if [[ "$1" =~ ^[0-9]+$ ]]; then
+                    lines="$1"
+                fi
+                shift
+                ;;
+        esac
+    done
+    if [ -z "$scene_id" ] && [ -f "$CURRENT_SCENE_FILE" ]; then
+        scene_id=$(cat "$CURRENT_SCENE_FILE")
+    fi
+    set_instance_context "$scene_id"
     print_header "ChatMock 日志 (最近 $lines 行)"
     
     if [ -f "$LOG_FILE" ]; then
@@ -707,6 +803,22 @@ logs_chatmock() {
 
 # 测试服务
 test_chatmock() {
+    local scene_id=""
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --scene|-s)
+                scene_id="$2"
+                shift 2
+                ;;
+            *)
+                shift
+                ;;
+        esac
+    done
+    if [ -z "$scene_id" ] && [ -f "$CURRENT_SCENE_FILE" ]; then
+        scene_id=$(cat "$CURRENT_SCENE_FILE")
+    fi
+    set_instance_context "$scene_id"
     print_header "测试 ChatMock 服务"
     
     # 获取服务地址
@@ -888,7 +1000,8 @@ main() {
             start_chatmock "$@"
             ;;
         stop)
-            stop_chatmock
+            shift
+            stop_chatmock "$@"
             ;;
         restart)
             check_chatmock
@@ -896,13 +1009,16 @@ main() {
             restart_chatmock "$@"
             ;;
         status)
-            status_chatmock
+            shift
+            status_chatmock "$@"
             ;;
         logs)
-            logs_chatmock "$2"
+            shift
+            logs_chatmock "$@"
             ;;
         test)
-            test_chatmock
+            shift
+            test_chatmock "$@"
             ;;
         scenes)
             list_scenes
