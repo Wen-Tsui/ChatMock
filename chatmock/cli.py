@@ -334,12 +334,18 @@ def main() -> None:
     )
     p_serve.add_argument(
         "--enable-web-search",
-        action=argparse.BooleanOptionalAction,
+        action="store_true",
         default=(os.getenv("CHATGPT_LOCAL_ENABLE_WEB_SEARCH") or "").strip().lower() in ("1", "true", "yes", "on"),
         help=(
             "Enable default web_search tool when a request omits responses_tools (off by default). "
             "Also configurable via CHATGPT_LOCAL_ENABLE_WEB_SEARCH."
         ),
+    )
+    p_serve.add_argument(
+        "--disable-web-search",
+        action="store_true",
+        default=False,
+        help="Disable web search tool"
     )
 
     p_info = sub.add_parser("info", help="Print current stored tokens and derived account id")
@@ -350,6 +356,11 @@ def main() -> None:
     if args.command == "login":
         sys.exit(cmd_login(no_browser=args.no_browser, verbose=args.verbose))
     elif args.command == "serve":
+        # Handle web search flag for Python 3.8 compatibility
+        default_web_search = args.enable_web_search
+        if args.disable_web_search:
+            default_web_search = False
+        
         sys.exit(
             cmd_serve(
                 host=args.host,
@@ -360,7 +371,7 @@ def main() -> None:
                 reasoning_compat=args.reasoning_compat,
                 debug_model=args.debug_model,
                 expose_reasoning_models=args.expose_reasoning_models,
-                default_web_search=args.enable_web_search,
+                default_web_search=default_web_search,
             )
         )
     elif args.command == "info":
