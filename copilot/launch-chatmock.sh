@@ -246,6 +246,7 @@ except:
         cmd="$cmd --port $port"
         cmd="$cmd --reasoning $reasoning"
         cmd="$cmd --web-search $web_search"
+        cmd="$cmd --verbose"
         
         if [ "$background" = "true" ]; then
             # 后台启动

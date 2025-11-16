@@ -45,6 +45,18 @@ def normalize_model_name(name: str | None, debug_model: str | None = None) -> st
         "codex-mini": "codex-mini-latest",
         "codex-mini-latest": "codex-mini-latest",
     }
+    lowered_base = base.lower()
+
+    # Translate Anthropic/Claude style names to the closest ChatGPT models we support.
+    claude_aliases = {
+        "claude-haiku": "gpt-5.1-codex-mini",
+        "claude-sonnet": "gpt-5.1-codex",
+        "claude-opus": "gpt-5.1",
+    }
+    for prefix, mapped in claude_aliases.items():
+        if lowered_base.startswith(prefix):
+            return mapped
+
     return mapping.get(base, base)
 
 
@@ -56,6 +68,7 @@ def start_upstream_request(
     tools: List[Dict[str, Any]] | None = None,
     tool_choice: Any | None = None,
     parallel_tool_calls: bool = False,
+    max_output_tokens: int | None = None,
     reasoning_param: Dict[str, Any] | None = None,
 ):
     access_token, account_id = get_effective_chatgpt_auth()
@@ -100,6 +113,8 @@ def start_upstream_request(
         "stream": True,
         "prompt_cache_key": session_id,
     }
+    if isinstance(max_output_tokens, int) and max_output_tokens > 0:
+        responses_payload["max_output_tokens"] = max_output_tokens
     if include:
         responses_payload["include"] = include
 

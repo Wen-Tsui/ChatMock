@@ -280,4 +280,140 @@ flowchart LR
 - **观测性与调试**：
   - 标准化 `_chatmock_request_ctx`，将上游请求上下文通过日志或调试接口暴露出来，便于追踪问题。
 
-以上就是 ChatMock 当前实现所对应的架构设计与数据流说明，可随着代码演进同步更新本文件。
+## 6. Claude Code 下游 API 设计
+
+本节在保持上游仅对接 ChatGPT Responses API 不变的前提下，细化 **在下游同时支持 OpenAI 兼容 API 与 Claude Code 风格 API** 的设计方案。Claude 相关的 API 差异与建议基于你提供的示例总结而来。
+
+### 6.1 设计目标与约束
+
+- **上游不变**：继续只调用 ChatGPT Responses API（`upstream.py` 无需引入 Claude/Anthropic 上游）。
+- **下游多协议**：在现有 OpenAI 兼容接口基础上，增加一套 Claude Code 风格 HTTP API（结构对齐 Anthropic messages API）。
+- **内部统一抽象**：
+  - OpenAI & Claude Code 两种协议均转换为统一的 `InternalChatRequest` / `InternalChatResponse` 结构。
+  - 再由 `upstream.start_upstream_request` 将该内部结构映射到 ChatGPT Responses API。
+- **最小侵入改造**：
+  - 现有 `routes_openai.py`、`upstream.py` 行为尽量保持不变，新增模块以适配 Claude Code。
+
+### 6.2 Claude / ChatGPT API 差异归纳
+
+结合示例代码与官方文档，两类 API 的差异大致可以归纳为：
+
+- **max_tokens**：
+  - Claude：通常为必需参数，用于限制输出 token 数。
+  - ChatGPT：为可选参数，默认由后端自动控制。
+- **system 提示词**：
+  - Claude：通过独立的 `system` 字段传入系统提示。
+  - ChatGPT：通常作为 `messages` 数组中的 `{"role": "system"}` 元素。
+- **消息结构**：
+  - Claude：`messages=[{"role": "user", "content": [{"type": "text", ...}, ...]}]`，`content` 是多模态数组（text/image/document）。
+  - ChatGPT：`messages=[{"role": "user", "content": "..."}]` 或 `content` 为简单文本/结构化内容。
+- **工具调用 (tools)**：
+  - 两者都有 `tools` 概念，但字段名与 JSON 结构略有不同；需要在适配层进行转换和裁剪。
+- **流式响应 (stream)**：
+  - Claude & ChatGPT 均使用 `stream=True`，但事件类型和字段名称不同；在 ChatMock 中统一转换为内部事件，再映射到对应下游协议格式。
+
+在 ChatMock 中，这些差异将被封装在路由层和转换层，避免污染上游调用逻辑。
+
+### 6.3 新增 Claude Code 路由蓝图
+
+新增 `chatmock/routes_claude_code.py`，提供面向下游的 Claude Code 风格 HTTP 接口：
+
+- **典型路由设计**：
+  - `POST /claude/v1/code/completions`
+  - `POST /claude/v1/chat/completions`
+
+- **总体处理流程**：
+  1. 解析请求体（JSON），读取：
+     - `model`、`max_tokens`（若缺失则给出默认值或返回 400）。
+     - `system` 字段（若存在），以及 `messages` 数组。
+     - `tools`、`stream`、项目上下文、文件路径等扩展字段（如 `files`、`context`）。
+  2. 调用转换层 `transform.from_claude_code_request(payload)`：
+     - 将 Claude 风格的 `system`/`messages`/`tools` 转换为内部 `InternalChatRequest`：
+       - `system` → 内部 `instructions`。
+       - `messages` → 内部 `messages`（统一成 ChatMock 现有的 `input_items` 构造所需格式）。
+       - `max_tokens` → 映射为上游 Responses 的限制参数（可以附加在 `reasoning` 或使用上游对应字段）。
+     - 处理多模态内容：将 Claude `content` 中的 `type=text/image` 转换为 ChatMock 当前使用的 `input_text` / `input_image` 结构。
+  3. 根据请求中的 `reasoning` 或模型名，构造 `reasoning_param`（重用 `reasoning.py` 逻辑）。
+  4. 调用 `upstream.start_upstream_request`：
+     - 上游依然是 ChatGPT Responses API，不直接调用 Claude/Anthropic。
+  5. 解析上游 SSE：将 `response.output_text.delta`、`response.reasoning_*` 等事件聚合为 `InternalChatResponse` 或流式内部事件。
+  6. 调用 `transform.to_claude_code_response(...)`：
+     - 将内部结构转换为 Claude Code 习惯使用的 JSON 结构：
+       - 顶层字段（如 `id`、`type`、`model`、`usage`）。
+       - `content` 数组中的 `text` 类型片段。
+       - 工具调用/函数调用的结构（若需要，与 Claude 习惯格式对齐）。
+  7. 根据 `stream` 参数决定返回方式：
+     - `stream=True`：以 SSE 事件流返回，事件 payload 为 Claude 风格结构。
+     - `stream=False`：返回一次性 JSON 响应。
+
+- **与 app.py 集成**：
+  - 在 `create_app` 中注册蓝图：
+    - `app.register_blueprint(claude_code_bp, url_prefix="/claude")`
+
+### 6.4 转换层（transform.py）细化
+
+在前面的高层设计中已经引入 `transform.py` 的概念，此处基于 Claude / ChatGPT 差异进一步细化：
+
+- **内部数据模型（示意）**：
+  - `InternalChatRequest`：
+    - 字段：`model`, `instructions`, `messages`, `tools`, `reasoning`, `stream`, `max_output_tokens`, `metadata` 等。
+  - `InternalChatMessage`：
+    - 字段：`role` (user/assistant/tool/system)、`content`（标准化后的文本/图片对象数组）。
+  - `InternalChatResponse` / `InternalChatChunk`：
+    - 字段：`id`, `model`, `output_text`, `reasoning_summary`, `reasoning_full`, `tool_calls`, `usage` 等。
+
+- **转换函数**：
+  - OpenAI 路由使用：
+    - `from_openai_chat_request(payload) -> InternalChatRequest`
+    - `to_openai_chat_response(internal) -> dict`
+  - Claude Code 路由使用：
+    - `from_claude_code_request(payload) -> InternalChatRequest`
+    - `to_claude_code_response(internal) -> dict`
+
+- **Claude 相关细节处理**：
+  - **system 提示词**：
+    - 从 Claude 请求的 `system` 字段中取出基础系统提示，如果下游仍附加了 `role=system` 的 message，则进行合并/去重。
+  - **max_tokens 必填**：
+    - 校验 Claude 请求是否提供 `max_tokens`，若缺失：
+      - 可采用配置中的默认 `CLAUDE_CODE_MAX_TOKENS_DEFAULT`；
+      - 或返回 400 提示调用方补充，视产品策略而定。
+  - **文件内容注入**：
+    - 对于 `files` 字段，可在转换层读取本地文件，并将内容以追加 `content` text 段的方式加入到内部消息中：
+      - 例如：“File: path\n```\n内容\n```”。
+    - 该行为对应你示例中的 `_prepare_messages` 逻辑，只是放在服务端转换层执行。
+
+### 6.5 流式响应、对话历史与上下文
+
+- **流式响应**：
+  - 继续依赖 Responses API 的 SSE 输出，在 `utils` 中统一解析事件。
+  - 对 Claude Code 路由：
+    - 将内部事件按 Claude 规范序列化为 SSE `data: {...}`；
+    - 保证事件顺序和结束标志（如 `[DONE]`）与 Claude 客户端预期一致。
+
+- **对话历史**：
+  - ChatMock 本身是无状态 HTTP 服务，但可以依赖：
+    - 客户端将历史消息重新发回；或
+    - 通过 `session_id` / `prompt_cache_key` 利用上游缓存能力。
+  - 在 Claude Code 路由中，保持与 OpenAI 路由一致的策略：
+    - 不在服务端持久化完整对话，只依赖请求内消息或上游 cache。
+
+- **项目上下文 (context)**：
+  - 对于代码任务，可在请求中提供 `context` 字段（如语言、框架、依赖等），
+    - 转换层将其拼接进 `instructions` 或首条 user message，类似你示例中的 `_build_system_prompt` 行为。
+
+### 6.6 与现有 OpenAI API 的统一抽象
+
+结合你提供的 `UnifiedCodeAPI` 思路，可以把 ChatMock 的 HTTP 设计理解为“服务端版 UnifiedCodeAPI”：
+
+- **客户端视角**：
+  - OpenAI 客户端：继续调用 `/v1/chat/completions`、`/v1/completions` 等现有接口，不感知 Claude Code 的存在。
+  - Claude Code 客户端：调用 `/claude/v1/...` 路径，使用 Claude 习惯的请求结构（`system` + 多模态 `content` + 必填 `max_tokens`）。
+
+- **服务端视角**：
+  - `routes_openai.py` 相当于 `_openai_chat` 适配层；
+  - `routes_claude_code.py` 相当于 `_claude_chat` 适配层；
+  - 二者都依赖 `transform.py`（统一内部结构）和 `upstream.py`（统一上游 ChatGPT 调用）。
+
+通过这种分层设计，可以在 **不改动上游 ChatGPT 依赖** 的前提下，为下游新增完整的 Claude Code API 能力，同时保持架构清晰、可扩展。
+
+以上是包含 Claude Code 下游扩展后的 ChatMock 架构设计，可在实际实现过程中进一步细化到具体字段名与错误码策略，并在需要时拆分为独立的 Claude Code 专用文档。
