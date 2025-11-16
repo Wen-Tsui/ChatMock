@@ -7,6 +7,10 @@ import json
 import os
 import secrets
 import sys
+import queue
+import threading
+import time
+from copy import deepcopy
 from typing import Any, Dict, List, Optional, Tuple
 
 import requests
@@ -395,7 +399,14 @@ def sse_translate_chat(
     ws_state: dict[str, Any] = {}
     ws_index: dict[str, int] = {}
     ws_next_index: int = 0
-    
+    request_ctx: Dict[str, Any] | None = getattr(upstream, "_chatmock_request_ctx", None)
+    max_resume_attempts = 2
+    resume_attempts = 0
+    resume_token: str | None = None
+    keepalive_interval = 15.0
+    keepalive_frame = b'data: {"type":"keepalive"}\n\n'
+    reasoning_cache: List[str] = []
+
     def _serialize_tool_args(eff_args: Any) -> str:
         """
         Serialize tool call arguments with proper JSON handling.
@@ -431,346 +442,487 @@ def sse_translate_chat(
             return {"prompt_tokens": pt, "completion_tokens": ct, "total_tokens": tt}
         except Exception:
             return None
-    try:
+    def _record_reasoning(delta_txt: str) -> None:
+        if isinstance(delta_txt, str) and delta_txt:
+            reasoning_cache.append(delta_txt)
+
+    def _update_resume_state(evt: Dict[str, Any]) -> None:
+        nonlocal resume_token
+        resp = evt.get("response")
+        candidates: List[str] = []
+        if isinstance(resp, dict):
+            for key in (
+                "range_end_token",
+                "range_start_token",
+                "next_range_start_token",
+                "cursor",
+            ):
+                value = resp.get(key)
+                if isinstance(value, str):
+                    candidates.append(value)
+            range_info = resp.get("range")
+            if isinstance(range_info, dict):
+                for key in ("end_token", "next_start_token", "end", "next_start"):
+                    value = range_info.get(key)
+                    if isinstance(value, str):
+                        candidates.append(value)
+        delta_range = evt.get("delta_range")
+        if isinstance(delta_range, dict):
+            for key in ("end", "token_end"):
+                value = delta_range.get(key)
+                if isinstance(value, str):
+                    candidates.append(value)
+        for candidate in candidates:
+            if candidate:
+                resume_token = candidate
+                break
+
+    def _clone_payload() -> Dict[str, Any]:
+        base_payload = {}
+        if isinstance(request_ctx, dict):
+            base_payload = request_ctx.get("payload") or {}
+        return deepcopy(base_payload) if isinstance(base_payload, dict) else {}
+
+    def _attempt_resume(exc: Exception) -> bool:
+        nonlocal upstream, resume_attempts
+        if not request_ctx or resume_attempts >= max_resume_attempts:
+            return False
+        resume_attempts += 1
+        payload = _clone_payload()
+        if resume_token:
+            payload["range_start_token"] = resume_token
+        else:
+            payload.pop("range_start_token", None)
+        headers = dict(request_ctx.get("headers") or {})
+        url = request_ctx.get("url") or getattr(getattr(upstream, "request", None), "url", None)
+        timeout = request_ctx.get("timeout", 600)
+        if not url:
+            return False
         try:
-            line_iterator = upstream.iter_lines(decode_unicode=False)
-        except requests.exceptions.ChunkedEncodingError as e:
+            new_resp = requests.post(
+                url,
+                headers=headers,
+                json=payload,
+                stream=True,
+                timeout=timeout,
+            )
+        except requests.RequestException as err:
             if verbose and vlog:
-                vlog(f"Failed to start stream: {e}")
-            yield b"data: [DONE]\n\n"
-            return
+                vlog(f"Resume attempt #{resume_attempts} failed: {err}")
+            return False
+        if new_resp.status_code >= 400:
+            if verbose and vlog:
+                vlog(f"Resume attempt #{resume_attempts} failed with status {new_resp.status_code}")
+            return False
+        setattr(new_resp, "_chatmock_request_ctx", request_ctx)
+        try:
+            upstream.close()
+        except Exception:
+            pass
+        upstream = new_resp
+        if verbose and vlog:
+            token_preview = resume_token[:8] + "…" if isinstance(resume_token, str) and len(resume_token) > 8 else resume_token
+            vlog(f"Reconnected upstream stream (range_start_token={token_preview!r})")
+        return True
 
-        for raw in line_iterator:
+    def _emit_stream_failure(message: str):
+        payload: Dict[str, Any] = {"error": {"message": message}}
+        if reasoning_cache:
+            payload["partial_reasoning"] = "".join(reasoning_cache)
+        yield f"data: {json.dumps(payload)}\n\n".encode("utf-8")
+        yield b"data: [DONE]\n\n"
+
+    def _start_worker(resp):
+        q: queue.Queue = queue.Queue()
+        stop_flag = threading.Event()
+
+        def _worker():
             try:
-                if not raw:
-                    continue
-                line = (
-                    raw.decode("utf-8", errors="ignore")
-                    if isinstance(raw, (bytes, bytearray))
-                    else raw
-                )
-                if verbose and vlog:
-                    vlog(line)
-                if not line.startswith("data: "):
-                    continue
-                data = line[len("data: ") :].strip()
-                if not data:
-                    continue
-                if data == "[DONE]":
-                    break
-                try:
-                    evt = json.loads(data)
-                except (json.JSONDecodeError, UnicodeDecodeError):
-                    continue
-            except (
-                requests.exceptions.ChunkedEncodingError,
-                ConnectionError,
-                BrokenPipeError,
-            ) as e:
-                # Connection interrupted mid-stream - end gracefully
-                if verbose and vlog:
-                    vlog(f"Stream interrupted: {e}")
-                yield b"data: [DONE]\n\n"
-                return
-            kind = evt.get("type")
-            if isinstance(evt.get("response"), dict) and isinstance(evt["response"].get("id"), str):
-                response_id = evt["response"].get("id") or response_id
+                for raw_line in resp.iter_lines(decode_unicode=False):
+                    if stop_flag.is_set():
+                        break
+                    q.put(("line", raw_line))
+            except Exception as exc:
+                q.put(("error", exc))
+            finally:
+                q.put(("done", None))
 
-            if isinstance(kind, str) and ("web_search_call" in kind):
+        thread = threading.Thread(target=_worker, daemon=True)
+        thread.start()
+        return q, stop_flag, thread
+
+    try:
+        stream_complete = False
+        last_error_message: str | None = None
+        while not stream_complete:
+            line_queue, stop_flag, worker_thread = _start_worker(upstream)
+            connection_error: Exception | None = None
+            graceful_shutdown = False
+            while True:
                 try:
-                    call_id = evt.get("item_id") or "ws_call"
+                    msg_type, payload = line_queue.get(timeout=keepalive_interval)
+                except queue.Empty:
+                    yield keepalive_frame
+                    continue
+                if msg_type == "line":
+                    raw = payload
+                    if not raw:
+                        continue
+                    line = (
+                        raw.decode("utf-8", errors="ignore")
+                        if isinstance(raw, (bytes, bytearray))
+                        else raw
+                    )
                     if verbose and vlog:
-                        try:
-                            vlog(f"CM_TOOLS {kind} id={call_id} -> tool_calls(web_search)")
-                        except Exception:
-                            pass
-                    item = evt.get('item') if isinstance(evt.get('item'), dict) else {}
-                    params_dict = ws_state.setdefault(call_id, {}) if isinstance(ws_state.get(call_id), dict) else {}
-                    def _merge_from(src):
-                        if not isinstance(src, dict):
-                            return
-                        for whole in ('parameters','args','arguments','input'):
-                            if isinstance(src.get(whole), dict):
-                                params_dict.update(src.get(whole))
-                        if isinstance(src.get('query'), str): params_dict.setdefault('query', src.get('query'))
-                        if isinstance(src.get('q'), str): params_dict.setdefault('query', src.get('q'))
-                        for rk in ('recency','time_range','days'):
-                            if src.get(rk) is not None and rk not in params_dict: params_dict[rk] = src.get(rk)
-                        for dk in ('domains','include_domains','include'):
-                            if isinstance(src.get(dk), list) and 'domains' not in params_dict: params_dict['domains'] = src.get(dk)
-                        for mk in ('max_results','topn','limit'):
-                            if src.get(mk) is not None and 'max_results' not in params_dict: params_dict['max_results'] = src.get(mk)
-                    _merge_from(item)
-                    _merge_from(evt if isinstance(evt, dict) else None)
-                    params = params_dict if params_dict else None
-                    if isinstance(params, dict):
-                        try:
-                            ws_state.setdefault(call_id, {}).update(params)
-                        except Exception:
-                            pass
-                    eff_params = ws_state.get(call_id, params if isinstance(params, (dict, list, str)) else {})
-                    args_str = _serialize_tool_args(eff_params)
-                    if call_id not in ws_index:
-                        ws_index[call_id] = ws_next_index
-                        ws_next_index += 1
-                    _idx = ws_index.get(call_id, 0)
-                    delta_chunk = {
-                        "id": response_id,
-                        "object": "chat.completion.chunk",
-                        "created": created,
-                        "model": model,
-                        "choices": [
-                            {
-                                "index": 0,
-                                "delta": {
-                                    "tool_calls": [
-                                        {
-                                            "index": _idx,
-                                            "id": call_id,
-                                            "type": "function",
-                                            "function": {"name": "web_search", "arguments": args_str},
-                                        }
-                                    ]
-                                },
-                                "finish_reason": None,
-                            }
-                        ],
-                    }
-                    yield f"data: {json.dumps(delta_chunk)}\n\n".encode("utf-8")
-                    if kind.endswith(".completed") or kind.endswith(".done"):
-                        finish_chunk = {
-                            "id": response_id,
-                            "object": "chat.completion.chunk",
-                            "created": created,
-                            "model": model,
-                            "choices": [
-                                {"index": 0, "delta": {}, "finish_reason": "tool_calls"}
-                            ],
-                        }
-                        yield f"data: {json.dumps(finish_chunk)}\n\n".encode("utf-8")
-                except Exception:
-                    pass
-
-            if kind == "response.output_text.delta":
-                delta = evt.get("delta") or ""
-                if compat == "think-tags" and think_open and not think_closed:
-                    close_chunk = {
-                        "id": response_id,
-                        "object": "chat.completion.chunk",
-                        "created": created,
-                        "model": model,
-                        "choices": [{"index": 0, "delta": {"content": "</think>"}, "finish_reason": None}],
-                    }
-                    yield f"data: {json.dumps(close_chunk)}\n\n".encode("utf-8")
-                    think_open = False
-                    think_closed = True
-                saw_output = True
-                chunk = {
-                    "id": response_id,
-                    "object": "chat.completion.chunk",
-                    "created": created,
-                    "model": model,
-                    "choices": [{"index": 0, "delta": {"content": delta}, "finish_reason": None}],
-                }
-                yield f"data: {json.dumps(chunk)}\n\n".encode("utf-8")
-            elif kind == "response.output_item.done":
-                item = evt.get("item") or {}
-                if isinstance(item, dict) and (item.get("type") == "function_call" or item.get("type") == "web_search_call"):
-                    call_id = item.get("call_id") or item.get("id") or ""
-                    name = item.get("name") or ("web_search" if item.get("type") == "web_search_call" else "")
-                    raw_args = item.get("arguments") or item.get("parameters")
-                    if isinstance(raw_args, dict):
-                        try:
-                            ws_state.setdefault(call_id, {}).update(raw_args)
-                        except Exception:
-                            pass
-                    eff_args = ws_state.get(call_id, raw_args if isinstance(raw_args, (dict, list, str)) else {})
+                        vlog(line)
+                    if not line.startswith("data: "):
+                        continue
+                    data = line[len("data: ") :].strip()
+                    if not data:
+                        continue
+                    if data == "[DONE]":
+                        graceful_shutdown = True
+                        stream_complete = True
+                        break
                     try:
-                        args = _serialize_tool_args(eff_args)
-                    except Exception:
-                        args = "{}"
-                    if item.get("type") == "web_search_call" and verbose and vlog:
-                        try:
-                            vlog(f"CM_TOOLS response.output_item.done web_search_call id={call_id} has_args={bool(args)}")
-                        except Exception:
-                            pass
-                    if call_id not in ws_index:
-                        ws_index[call_id] = ws_next_index
-                        ws_next_index += 1
-                    _idx = ws_index.get(call_id, 0)
-                    if isinstance(call_id, str) and isinstance(name, str) and isinstance(args, str):
-                        delta_chunk = {
-                            "id": response_id,
-                            "object": "chat.completion.chunk",
-                            "created": created,
-                            "model": model,
-                            "choices": [
-                                {
-                                    "index": 0,
-                                    "delta": {
-                                        "tool_calls": [
-                                            {
-                                                "index": _idx,
-                                                "id": call_id,
-                                                "type": "function",
-                                                "function": {"name": name, "arguments": args},
-                                            }
-                                        ]
-                                    },
-                                    "finish_reason": None,
-                                }
-                            ],
-                        }
-                        yield f"data: {json.dumps(delta_chunk)}\n\n".encode("utf-8")
+                        evt = json.loads(data)
+                    except (json.JSONDecodeError, UnicodeDecodeError):
+                        continue
+                    kind = evt.get("type")
+                    _update_resume_state(evt)
+                    if isinstance(evt.get("response"), dict) and isinstance(evt["response"].get("id"), str):
+                        response_id = evt["response"].get("id") or response_id
 
-                        finish_chunk = {
-                            "id": response_id,
-                            "object": "chat.completion.chunk",
-                            "created": created,
-                            "model": model,
-                            "choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}],
-                        }
-                        yield f"data: {json.dumps(finish_chunk)}\n\n".encode("utf-8")
-            elif kind == "response.reasoning_summary_part.added":
-                if compat in ("think-tags", "o3"):
-                    if saw_any_summary:
-                        pending_summary_paragraph = True
-                    else:
-                        saw_any_summary = True
-            elif kind in ("response.reasoning_summary_text.delta", "response.reasoning_text.delta"):
-                delta_txt = evt.get("delta") or ""
-                if compat == "o3":
-                    if kind == "response.reasoning_summary_text.delta" and pending_summary_paragraph:
-                        nl_chunk = {
-                            "id": response_id,
-                            "object": "chat.completion.chunk",
-                            "created": created,
-                            "model": model,
-                            "choices": [
-                                {
-                                    "index": 0,
-                                    "delta": {"reasoning": {"content": [{"type": "text", "text": "\n"}]}},
-                                    "finish_reason": None,
-                                }
-                            ],
-                        }
-                        yield f"data: {json.dumps(nl_chunk)}\n\n".encode("utf-8")
-                        pending_summary_paragraph = False
-                    chunk = {
-                        "id": response_id,
-                        "object": "chat.completion.chunk",
-                        "created": created,
-                        "model": model,
-                        "choices": [
-                            {
-                                "index": 0,
-                                "delta": {"reasoning": {"content": [{"type": "text", "text": delta_txt}]}},
-                                "finish_reason": None,
-                            }
-                        ],
-                    }
-                    yield f"data: {json.dumps(chunk)}\n\n".encode("utf-8")
-                elif compat == "think-tags":
-                    if not think_open and not think_closed:
-                        open_chunk = {
-                            "id": response_id,
-                            "object": "chat.completion.chunk",
-                            "created": created,
-                            "model": model,
-                            "choices": [{"index": 0, "delta": {"content": "<think>"}, "finish_reason": None}],
-                        }
-                        yield f"data: {json.dumps(open_chunk)}\n\n".encode("utf-8")
-                        think_open = True
-                    if think_open and not think_closed:
-                        if kind == "response.reasoning_summary_text.delta" and pending_summary_paragraph:
-                            nl_chunk = {
+                    if isinstance(kind, str) and ("web_search_call" in kind):
+                        try:
+                            call_id = evt.get("item_id") or "ws_call"
+                            if verbose and vlog:
+                                try:
+                                    vlog(f"CM_TOOLS {kind} id={call_id} -> tool_calls(web_search)")
+                                except Exception:
+                                    pass
+                            item = evt.get("item") if isinstance(evt.get("item"), dict) else {}
+                            params_dict = ws_state.setdefault(call_id, {}) if isinstance(ws_state.get(call_id), dict) else {}
+
+                            def _merge_from(src):
+                                if not isinstance(src, dict):
+                                    return
+                                for whole in ("parameters", "args", "arguments", "input"):
+                                    if isinstance(src.get(whole), dict):
+                                        params_dict.update(src.get(whole))
+                                if isinstance(src.get("query"), str):
+                                    params_dict.setdefault("query", src.get("query"))
+                                if isinstance(src.get("q"), str):
+                                    params_dict.setdefault("query", src.get("q"))
+                                for rk in ("recency", "time_range", "days"):
+                                    if src.get(rk) is not None and rk not in params_dict:
+                                        params_dict[rk] = src.get(rk)
+                                for dk in ("domains", "include_domains", "include"):
+                                    if isinstance(src.get(dk), list) and "domains" not in params_dict:
+                                        params_dict["domains"] = src.get(dk)
+                                for mk in ("max_results", "topn", "limit"):
+                                    if src.get(mk) is not None and "max_results" not in params_dict:
+                                        params_dict["max_results"] = src.get(mk)
+
+                            _merge_from(item)
+                            _merge_from(evt if isinstance(evt, dict) else None)
+                            params = params_dict if params_dict else None
+                            if isinstance(params, dict):
+                                try:
+                                    ws_state.setdefault(call_id, {}).update(params)
+                                except Exception:
+                                    pass
+                            eff_params = ws_state.get(call_id, params if isinstance(params, (dict, list, str)) else {})
+                            args_str = _serialize_tool_args(eff_params)
+                            if call_id not in ws_index:
+                                ws_index[call_id] = ws_next_index
+                                ws_next_index += 1
+                            _idx = ws_index.get(call_id, 0)
+                            delta_chunk = {
                                 "id": response_id,
                                 "object": "chat.completion.chunk",
                                 "created": created,
                                 "model": model,
-                                "choices": [{"index": 0, "delta": {"content": "\n"}, "finish_reason": None}],
+                                "choices": [
+                                    {
+                                        "index": 0,
+                                        "delta": {
+                                            "tool_calls": [
+                                                {
+                                                    "index": _idx,
+                                                    "id": call_id,
+                                                    "type": "function",
+                                                    "function": {"name": "web_search", "arguments": args_str},
+                                                }
+                                            ]
+                                        },
+                                        "finish_reason": None,
+                                    }
+                                ],
                             }
-                            yield f"data: {json.dumps(nl_chunk)}\n\n".encode("utf-8")
-                            pending_summary_paragraph = False
-                        content_chunk = {
-                            "id": response_id,
-                            "object": "chat.completion.chunk",
-                            "created": created,
-                            "model": model,
-                            "choices": [{"index": 0, "delta": {"content": delta_txt}, "finish_reason": None}],
-                        }
-                        yield f"data: {json.dumps(content_chunk)}\n\n".encode("utf-8")
-                else:
-                    if kind == "response.reasoning_summary_text.delta":
-                        chunk = {
-                            "id": response_id,
-                            "object": "chat.completion.chunk",
-                            "created": created,
-                            "model": model,
-                            "choices": [
-                                {
-                                    "index": 0,
-                                    "delta": {"reasoning_summary": delta_txt, "reasoning": delta_txt},
-                                    "finish_reason": None,
+                            yield f"data: {json.dumps(delta_chunk)}\n\n".encode("utf-8")
+                            if kind.endswith(".completed") or kind.endswith(".done"):
+                                finish_chunk = {
+                                    "id": response_id,
+                                    "object": "chat.completion.chunk",
+                                    "created": created,
+                                    "model": model,
+                                    "choices": [
+                                        {"index": 0, "delta": {}, "finish_reason": "tool_calls"}
+                                    ],
                                 }
-                            ],
-                        }
-                        yield f"data: {json.dumps(chunk)}\n\n".encode("utf-8")
-                    else:
+                                yield f"data: {json.dumps(finish_chunk)}\n\n".encode("utf-8")
+                        except Exception:
+                            pass
+
+                    if kind == "response.output_text.delta":
+                        delta = evt.get("delta") or ""
+                        if compat == "think-tags" and think_open and not think_closed:
+                            close_chunk = {
+                                "id": response_id,
+                                "object": "chat.completion.chunk",
+                                "created": created,
+                                "model": model,
+                                "choices": [{"index": 0, "delta": {"content": "</think>"}, "finish_reason": None}],
+                            }
+                            yield f"data: {json.dumps(close_chunk)}\n\n".encode("utf-8")
+                            think_open = False
+                            think_closed = True
+                        saw_output = True
                         chunk = {
                             "id": response_id,
                             "object": "chat.completion.chunk",
                             "created": created,
                             "model": model,
-                            "choices": [
-                                {"index": 0, "delta": {"reasoning": delta_txt}, "finish_reason": None}
-                            ],
+                            "choices": [{"index": 0, "delta": {"content": delta}, "finish_reason": None}],
                         }
                         yield f"data: {json.dumps(chunk)}\n\n".encode("utf-8")
-            elif isinstance(kind, str) and kind.endswith(".done"):
-                pass
-            elif kind == "response.output_text.done":
-                chunk = {
-                    "id": response_id,
-                    "object": "chat.completion.chunk",
-                    "created": created,
-                    "model": model,
-                    "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
-                }
-                yield f"data: {json.dumps(chunk)}\n\n".encode("utf-8")
-            elif kind == "response.failed":
-                err = evt.get("response", {}).get("error", {}).get("message", "response.failed")
-                chunk = {"error": {"message": err}}
-                yield f"data: {json.dumps(chunk)}\n\n".encode("utf-8")
-            elif kind == "response.completed":
-                m = _extract_usage(evt)
-                if m:
-                    upstream_usage = m
-                if compat == "think-tags" and think_open and not think_closed:
-                    close_chunk = {
-                        "id": response_id,
-                        "object": "chat.completion.chunk",
-                        "created": created,
-                        "model": model,
-                        "choices": [{"index": 0, "delta": {"content": "</think>"}, "finish_reason": None}],
-                    }
-                    yield f"data: {json.dumps(close_chunk)}\n\n".encode("utf-8")
-                    think_open = False
-                    think_closed = True
-                if include_usage and upstream_usage:
-                    try:
-                        usage_chunk = {
+                    elif kind == "response.output_item.done":
+                        item = evt.get("item") or {}
+                        if isinstance(item, dict) and (
+                            item.get("type") == "function_call" or item.get("type") == "web_search_call"
+                        ):
+                            call_id = item.get("call_id") or item.get("id") or ""
+                            name = item.get("name") or ("web_search" if item.get("type") == "web_search_call" else "")
+                            raw_args = item.get("arguments") or item.get("parameters")
+                            if isinstance(raw_args, dict):
+                                try:
+                                    ws_state.setdefault(call_id, {}).update(raw_args)
+                                except Exception:
+                                    pass
+                            eff_args = ws_state.get(call_id, raw_args if isinstance(raw_args, (dict, list, str)) else {})
+                            try:
+                                args = _serialize_tool_args(eff_args)
+                            except Exception:
+                                args = "{}"
+                            if item.get("type") == "web_search_call" and verbose and vlog:
+                                try:
+                                    vlog(f"CM_TOOLS response.output_item.done web_search_call id={call_id} has_args={bool(args)}")
+                                except Exception:
+                                    pass
+                            if call_id not in ws_index:
+                                ws_index[call_id] = ws_next_index
+                                ws_next_index += 1
+                            _idx = ws_index.get(call_id, 0)
+                            if isinstance(call_id, str) and isinstance(name, str) and isinstance(args, str):
+                                delta_chunk = {
+                                    "id": response_id,
+                                    "object": "chat.completion.chunk",
+                                    "created": created,
+                                    "model": model,
+                                    "choices": [
+                                        {
+                                            "index": 0,
+                                            "delta": {
+                                                "tool_calls": [
+                                                    {
+                                                        "index": _idx,
+                                                        "id": call_id,
+                                                        "type": "function",
+                                                        "function": {"name": name, "arguments": args},
+                                                    }
+                                                ]
+                                            },
+                                            "finish_reason": None,
+                                        }
+                                    ],
+                                }
+                                yield f"data: {json.dumps(delta_chunk)}\n\n".encode("utf-8")
+
+                                finish_chunk = {
+                                    "id": response_id,
+                                    "object": "chat.completion.chunk",
+                                    "created": created,
+                                    "model": model,
+                                    "choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}],
+                                }
+                                yield f"data: {json.dumps(finish_chunk)}\n\n".encode("utf-8")
+                    elif kind == "response.reasoning_summary_part.added":
+                        if compat in ("think-tags", "o3"):
+                            if saw_any_summary:
+                                pending_summary_paragraph = True
+                            else:
+                                saw_any_summary = True
+                    elif kind in ("response.reasoning_summary_text.delta", "response.reasoning_text.delta"):
+                        delta_txt = evt.get("delta") or ""
+                        _record_reasoning(delta_txt)
+                        if compat == "o3":
+                            if kind == "response.reasoning_summary_text.delta" and pending_summary_paragraph:
+                                nl_chunk = {
+                                    "id": response_id,
+                                    "object": "chat.completion.chunk",
+                                    "created": created,
+                                    "model": model,
+                                    "choices": [
+                                        {
+                                            "index": 0,
+                                            "delta": {"reasoning": {"content": [{"type": "text", "text": "\n"}]}},
+                                            "finish_reason": None,
+                                        }
+                                    ],
+                                }
+                                yield f"data: {json.dumps(nl_chunk)}\n\n".encode("utf-8")
+                                pending_summary_paragraph = False
+                            chunk = {
+                                "id": response_id,
+                                "object": "chat.completion.chunk",
+                                "created": created,
+                                "model": model,
+                                "choices": [
+                                    {
+                                        "index": 0,
+                                        "delta": {"reasoning": {"content": [{"type": "text", "text": delta_txt}]}},
+                                        "finish_reason": None,
+                                    }
+                                ],
+                            }
+                            yield f"data: {json.dumps(chunk)}\n\n".encode("utf-8")
+                        elif compat == "think-tags":
+                            if not think_open and not think_closed:
+                                open_chunk = {
+                                    "id": response_id,
+                                    "object": "chat.completion.chunk",
+                                    "created": created,
+                                    "model": model,
+                                    "choices": [{"index": 0, "delta": {"content": "<think>"}, "finish_reason": None}],
+                                }
+                                yield f"data: {json.dumps(open_chunk)}\n\n".encode("utf-8")
+                                think_open = True
+                            if think_open and not think_closed:
+                                if kind == "response.reasoning_summary_text.delta" and pending_summary_paragraph:
+                                    nl_chunk = {
+                                        "id": response_id,
+                                        "object": "chat.completion.chunk",
+                                        "created": created,
+                                        "model": model,
+                                        "choices": [{"index": 0, "delta": {"content": "\n"}, "finish_reason": None}],
+                                    }
+                                    yield f"data: {json.dumps(nl_chunk)}\n\n".encode("utf-8")
+                                    pending_summary_paragraph = False
+                                content_chunk = {
+                                    "id": response_id,
+                                    "object": "chat.completion.chunk",
+                                    "created": created,
+                                    "model": model,
+                                    "choices": [{"index": 0, "delta": {"content": delta_txt}, "finish_reason": None}],
+                                }
+                                yield f"data: {json.dumps(content_chunk)}\n\n".encode("utf-8")
+                        else:
+                            if kind == "response.reasoning_summary_text.delta":
+                                chunk = {
+                                    "id": response_id,
+                                    "object": "chat.completion.chunk",
+                                    "created": created,
+                                    "model": model,
+                                    "choices": [
+                                        {
+                                            "index": 0,
+                                            "delta": {"reasoning_summary": delta_txt, "reasoning": delta_txt},
+                                            "finish_reason": None,
+                                        }
+                                    ],
+                                }
+                                yield f"data: {json.dumps(chunk)}\n\n".encode("utf-8")
+                            else:
+                                chunk = {
+                                    "id": response_id,
+                                    "object": "chat.completion.chunk",
+                                    "created": created,
+                                    "model": model,
+                                    "choices": [
+                                        {"index": 0, "delta": {"reasoning": delta_txt}, "finish_reason": None}
+                                    ],
+                                }
+                                yield f"data: {json.dumps(chunk)}\n\n".encode("utf-8")
+                    elif isinstance(kind, str) and kind.endswith(".done"):
+                        pass
+                    elif kind == "response.output_text.done":
+                        chunk = {
                             "id": response_id,
                             "object": "chat.completion.chunk",
                             "created": created,
                             "model": model,
-                            "choices": [{"index": 0, "delta": {}, "finish_reason": None}],
-                            "usage": upstream_usage,
+                            "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
                         }
-                        yield f"data: {json.dumps(usage_chunk)}\n\n".encode("utf-8")
-                    except Exception:
-                        pass
-                yield b"data: [DONE]\n\n"
+                        yield f"data: {json.dumps(chunk)}\n\n".encode("utf-8")
+                    elif kind == "response.failed":
+                        err = evt.get("response", {}).get("error", {}).get("message", "response.failed")
+                        chunk = {"error": {"message": err}}
+                        yield f"data: {json.dumps(chunk)}\n\n".encode("utf-8")
+                    elif kind == "response.completed":
+                        m = _extract_usage(evt)
+                        if m:
+                            upstream_usage = m
+                        if compat == "think-tags" and think_open and not think_closed:
+                            close_chunk = {
+                                "id": response_id,
+                                "object": "chat.completion.chunk",
+                                "created": created,
+                                "model": model,
+                                "choices": [{"index": 0, "delta": {"content": "</think>"}, "finish_reason": None}],
+                            }
+                            yield f"data: {json.dumps(close_chunk)}\n\n".encode("utf-8")
+                            think_open = False
+                            think_closed = True
+                        if include_usage and upstream_usage:
+                            try:
+                                usage_chunk = {
+                                    "id": response_id,
+                                    "object": "chat.completion.chunk",
+                                    "created": created,
+                                    "model": model,
+                                    "choices": [{"index": 0, "delta": {}, "finish_reason": None}],
+                                    "usage": upstream_usage,
+                                }
+                                yield f"data: {json.dumps(usage_chunk)}\n\n".encode("utf-8")
+                            except Exception:
+                                pass
+                        yield b"data: [DONE]\n\n"
+                        stream_complete = True
+                        graceful_shutdown = True
+                        break
+                elif msg_type == "error":
+                    connection_error = payload if isinstance(payload, Exception) else RuntimeError("Upstream stream error")
+                    break
+                elif msg_type == "done":
+                    if graceful_shutdown:
+                        break
+                    connection_error = ConnectionError("Upstream stream closed before [DONE]")
+                    break
+            stop_flag.set()
+            worker_thread.join(timeout=0.5)
+            if connection_error:
+                last_error_message = str(connection_error)
+                if verbose and vlog:
+                    vlog(f"Stream interrupted: {connection_error}")
+                if not _attempt_resume(connection_error):
+                    message = "Reasoning stream interrupted, please retry."
+                    if last_error_message:
+                        message = f"{message} ({last_error_message})"
+                    yield from _emit_stream_failure(message)
+                    return
+                continue
+            if stream_complete:
                 break
     finally:
         upstream.close()

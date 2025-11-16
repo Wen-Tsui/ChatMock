@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import time
+from copy import deepcopy
 from typing import Any, Dict, List, Tuple
 
 import requests
@@ -114,17 +115,26 @@ def start_upstream_request(
         "session_id": session_id,
     }
 
+    request_timeout = 1800
+    request_ctx = {
+        "url": CHATGPT_RESPONSES_URL,
+        "payload": deepcopy(responses_payload),
+        "headers": dict(headers),
+        "timeout": request_timeout,
+    }
+
     try:
         upstream = requests.post(
             CHATGPT_RESPONSES_URL,
             headers=headers,
             json=responses_payload,
             stream=True,
-            timeout=600,
+            timeout=request_timeout,
         )
     except requests.RequestException as e:
         resp = make_response(jsonify({"error": {"message": f"Upstream ChatGPT request failed: {e}"}}), 502)
         for k, v in build_cors_headers().items():
             resp.headers.setdefault(k, v)
         return None, resp
+    setattr(upstream, "_chatmock_request_ctx", request_ctx)
     return upstream, None

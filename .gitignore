@@ -25,3 +25,5 @@ dist/
 .serena
 .tmp
 .logs
+*.pid
+current_scene.txt
