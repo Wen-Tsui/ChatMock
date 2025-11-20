@@ -195,6 +195,56 @@ def convert_chat_messages_to_responses_input(messages: List[Dict[str, Any]]) -> 
 
 
 def convert_tools_chat_to_responses(tools: Any) -> List[Dict[str, Any]]:
+    """
+    Convert OpenAI-style tools to ChatGPT Responses API format.
+    
+    Enforces OpenAI's 64-character limit on tool names by intelligently truncating
+    long names while preserving readability.
+    """
+    MAX_TOOL_NAME_LENGTH = 64
+    
+    def _truncate_tool_name(name: str) -> str:
+        """
+        Intelligently truncate tool names to fit OpenAI's 64-character limit.
+        
+        Strategy:
+        1. If name <= 64 chars, return as-is
+        2. For MCP-style names (use_mcp_tool___server___toolname), try to preserve
+           the most important parts (server and tool name)
+        3. Otherwise, simple truncation with ellipsis indicator
+        """
+        if len(name) <= MAX_TOOL_NAME_LENGTH:
+            return name
+        
+        # Handle MCP-style tool names: use_mcp_tool___server___toolname
+        if name.startswith("use_mcp_tool___"):
+            parts = name.split("___")
+            if len(parts) >= 3:
+                prefix = "mcp"  # Shortened prefix (3 chars)
+                server = parts[1]  # Server name
+                tool = parts[2]    # Tool name
+                
+                # Calculate available space: 64 - prefix(3) - separators(2*3=6) = 55
+                available = MAX_TOOL_NAME_LENGTH - len(prefix) - 6
+                
+                # Allocate space: prefer keeping full tool name, truncate server if needed
+                if len(server) + len(tool) <= available:
+                    return f"{prefix}___{server}___{tool}"
+                
+                # If tool name alone is too long, truncate it
+                if len(tool) > available - 3:  # Reserve 3 chars for server minimum
+                    tool = tool[:available - 3]
+                    server = server[:3]
+                else:
+                    # Truncate server name to fit
+                    server = server[:available - len(tool)]
+                
+                return f"{prefix}___{server}___{tool}"
+        
+        # For non-MCP names, simple truncation
+        # Use last 2 chars as hash indicator to show it was truncated
+        return name[:MAX_TOOL_NAME_LENGTH - 2] + ".."
+    
     out: List[Dict[str, Any]] = []
     if not isinstance(tools, list):
         return out
@@ -207,6 +257,18 @@ def convert_tools_chat_to_responses(tools: Any) -> List[Dict[str, Any]]:
         name = fn.get("name") if isinstance(fn, dict) else None
         if not isinstance(name, str) or not name:
             continue
+        
+        # Truncate name if it exceeds OpenAI's limit
+        original_name = name
+        name = _truncate_tool_name(name)
+        
+        # Log truncation for debugging
+        if name != original_name:
+            try:
+                print(f"[ChatMock] Tool name truncated: '{original_name}' ({len(original_name)} chars) -> '{name}' ({len(name)} chars)", file=sys.stderr)
+            except Exception:
+                pass
+        
         desc = fn.get("description") if isinstance(fn, dict) else None
         params = fn.get("parameters") if isinstance(fn, dict) else None
         if not isinstance(params, dict):
