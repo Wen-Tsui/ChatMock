@@ -466,7 +466,7 @@ def sse_translate_chat(
     resume_attempts = 0
     resume_token: str | None = None
     keepalive_interval = 15.0
-    keepalive_frame = b'data: {"type":"keepalive"}\n\n'
+    keepalive_frame = b": keepalive\n\n"
     reasoning_cache: List[str] = []
 
     def _serialize_tool_args(eff_args: Any) -> str:
@@ -929,8 +929,19 @@ def sse_translate_chat(
                         yield f"data: {json.dumps(chunk)}\n\n".encode("utf-8")
                     elif kind == "response.failed":
                         err = evt.get("response", {}).get("error", {}).get("message", "response.failed")
-                        chunk = {"error": {"message": err}}
+                        chunk = {
+                            "id": response_id,
+                            "object": "chat.completion.chunk",
+                            "created": created,
+                            "model": model,
+                            "choices": [{"index": 0, "delta": {}, "finish_reason": "error"}],
+                            "error": {"message": err},
+                        }
                         yield f"data: {json.dumps(chunk)}\n\n".encode("utf-8")
+                        yield b"data: [DONE]\n\n"
+                        stream_complete = True
+                        graceful_shutdown = True
+                        break
                     elif kind == "response.completed":
                         m = _extract_usage(evt)
                         if m:
