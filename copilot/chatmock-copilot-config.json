@@ -10,10 +10,12 @@
       "temperature": 0.02,
       "top_p": 0.98,
       "max_tokens": 1024,
-      "reasoning_effort": "medium",
+      "reasoning_effort": "high",
+      "reasoning_summary": "auto",
       "frequency_penalty": 0.15,
       "presence_penalty": 0.08,
-      "context_length": 32000
+      "context_length": 32000,
+      "web_search_enabled": true
     },
     {
       "id": "gpt-5.1-codex",
@@ -25,11 +27,13 @@
       "top_p": 0.92,
       "max_tokens": 6144,
       "reasoning_effort": "high",
+      "reasoning_summary": "detailed",
       "frequency_penalty": 0.3,
       "presence_penalty": 0.2,
       "context_length": 96000,
       "enable_thinking": true,
-      "thinking_budget": 4000
+      "thinking_budget": 4000,
+      "web_search_enabled": true
     },
     {
       "id": "gpt-5.1",
@@ -41,11 +45,13 @@
       "top_p": 0.96,
       "max_tokens": 10240,
       "reasoning_effort": "high",
+      "reasoning_summary": "detailed",
       "frequency_penalty": 0.4,
       "presence_penalty": 0.3,
       "context_length": 200000,
       "enable_thinking": true,
-      "thinking_budget": 8000
+      "thinking_budget": 8000,
+      "web_search_enabled": true
     },
     {
       "id": "gpt-5.1",
@@ -57,10 +63,12 @@
       "top_p": 0.92,
       "max_tokens": 8192,
       "reasoning_effort": "medium",
+      "reasoning_summary": "auto",
       "frequency_penalty": 0.25,
       "presence_penalty": 0.35,
       "context_length": 128000,
-      "enable_thinking": true
+      "enable_thinking": true,
+      "web_search_enabled": true
     },
     {
       "id": "gpt-5.1-codex",
@@ -72,11 +80,13 @@
       "top_p": 1.0,
       "max_tokens": 5120,
       "reasoning_effort": "high",
+      "reasoning_summary": "detailed",
       "frequency_penalty": 0.0,
       "presence_penalty": 0.05,
       "context_length": 128000,
       "enable_thinking": true,
-      "thinking_budget": 6000
+      "thinking_budget": 6000,
+      "web_search_enabled": true
     },
     {
       "id": "gpt-5.1",
@@ -88,11 +98,46 @@
       "top_p": 0.93,
       "max_tokens": 7168,
       "reasoning_effort": "high",
+      "reasoning_summary": "auto",
       "frequency_penalty": 0.3,
       "presence_penalty": 0.25,
       "context_length": 128000,
       "enable_thinking": true,
-      "thinking_budget": 6000
+      "thinking_budget": 6000,
+      "web_search_enabled": false
+    },
+    {
+        "id": "gpt-5.1",
+        "owned_by": "chatmock",
+        "baseUrl": "http://127.0.0.1:8008/v1",
+        "configId": "chat-gpt",
+        "displayName": "ask",
+        "temperature": 0.42,
+        "top_p": 0.93,
+        "max_tokens": 7168,
+        "reasoning_effort": "high",
+        "reasoning_summary": "none",
+        "frequency_penalty": 0.3,
+        "presence_penalty": 0.25,
+        "context_length": 128000,
+        "thinking_budget": 6000,
+        "web_search_enabled": true
+    },
+    {
+        "id": "gpt-5.1",
+        "owned_by": "chatmock",
+        "baseUrl": "http://127.0.0.1:8009/v1",
+        "configId": "fastcoding",
+        "displayName": "Fast Coding",
+        "temperature": 0.02,
+        "top_p": 0.98,
+        "max_tokens": 1024,
+        "reasoning_effort": "low",
+        "reasoning_summary": "none",
+        "frequency_penalty": 0.15,
+        "presence_penalty": 0.08,
+        "context_length": 32000,
+        "web_search_enabled": false
     }
   ]
 }

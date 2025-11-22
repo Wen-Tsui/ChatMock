@@ -93,6 +93,7 @@ sanitize_config_file
 DEFAULT_HOST="127.0.0.1"
 DEFAULT_PORT="8001"
 DEFAULT_REASONING_EFFORT="medium"
+DEFAULT_REASONING_SUMMARY="auto"
 DEFAULT_MAX_CONNECTIONS="30"
 DEFAULT_TIMEOUT="60"
 
@@ -223,6 +224,45 @@ get_scene_reasoning_effort() {
     local scene_id=$1
     local reasoning_effort=$(get_scene_config "$scene_id" "reasoning_effort")
     echo "${reasoning_effort:-$DEFAULT_REASONING_EFFORT}"
+}
+
+# 获取场景的推理总结配置
+get_scene_reasoning_summary() {
+    local scene_id=$1
+    if [ -z "$scene_id" ]; then
+        echo "$DEFAULT_REASONING_SUMMARY"
+        return 0
+    fi
+
+    local reasoning_summary=$(get_scene_config "$scene_id" "reasoning_summary")
+    if [ -z "$reasoning_summary" ]; then
+        reasoning_summary=$(python3 - "$CONFIG_JSON_PATH" "$scene_id" <<'PY'
+import json, sys
+
+config_path = sys.argv[1]
+scene_id = sys.argv[2]
+
+try:
+    with open(config_path, 'r') as f:
+        config = json.load(f)
+    for model in config.get('oaicopilot.models', []):
+        if model.get('configId') == scene_id:
+            reasoning = model.get('reasoning') or {}
+            if isinstance(reasoning, dict):
+                summary = reasoning.get('summary')
+                if isinstance(summary, str):
+                    print(summary)
+                    sys.exit(0)
+            break
+except Exception:
+    pass
+print('')
+PY
+)
+    fi
+
+    reasoning_summary=${reasoning_summary:-$DEFAULT_REASONING_SUMMARY}
+    echo "$reasoning_summary"
 }
 
 # 获取场景的网络搜索配置
@@ -431,12 +471,14 @@ start_chatmock() {
     local host=$DEFAULT_HOST
     local port=$DEFAULT_PORT
     local reasoning_effort=$DEFAULT_REASONING_EFFORT
+    local reasoning_summary="$DEFAULT_REASONING_SUMMARY"
     local max_connections=$DEFAULT_MAX_CONNECTIONS
     local timeout=$DEFAULT_TIMEOUT
     local enable_web_search=false
     local host_provided=false
     local port_provided=false
     local reasoning_provided=false
+    local reasoning_summary_provided=false
     local connections_provided=false
     local timeout_provided=false
     local web_search_provided=false
@@ -461,6 +503,11 @@ start_chatmock() {
             --reasoning|-r)
                 reasoning_effort="$2"
                 reasoning_provided=true
+                shift 2
+                ;;
+            --reasoning-summary)
+                reasoning_summary="$2"
+                reasoning_summary_provided=true
                 shift 2
                 ;;
             --connections|-c)
@@ -491,6 +538,9 @@ start_chatmock() {
                 elif [[ "$1" =~ ^(low|medium|high|minimal)$ ]]; then
                     reasoning_effort="$1"
                     reasoning_provided=true
+                elif [[ "$1" =~ ^(auto|concise|detailed|none)$ ]]; then
+                    reasoning_summary="$1"
+                    reasoning_summary_provided=true
                 elif [[ "$1" =~ ^[0-9]+$ ]] && [ "$1" -gt 10 ]; then
                     max_connections="$1"
                     connections_provided=true
@@ -516,6 +566,7 @@ start_chatmock() {
         local config_host=""
         local config_port=""
         local config_reasoning=$(get_scene_reasoning_effort "$scene_id")
+        local config_reasoning_summary=$(get_scene_reasoning_summary "$scene_id")
         local config_web_search=$(get_scene_web_search "$scene_id")
         local config_connections=$(get_scene_max_connections "$scene_id")
         local config_timeout=$(get_scene_timeout "$scene_id")
@@ -530,6 +581,7 @@ start_chatmock() {
         
         # 使用配置文件的值，但允许命令行参数覆盖
         [ "$reasoning_provided" = "false" ] && [ -n "$config_reasoning" ] && reasoning_effort="$config_reasoning"
+        [ "$reasoning_summary_provided" = "false" ] && [ -n "$config_reasoning_summary" ] && reasoning_summary="$config_reasoning_summary"
         [ "$web_search_provided" = "false" ] && [ -n "$config_web_search" ] && enable_web_search="$config_web_search"
         [ "$connections_provided" = "false" ] && [ -n "$config_connections" ] && max_connections="$config_connections"
         [ "$timeout_provided" = "false" ] && [ -n "$config_timeout" ] && timeout="$config_timeout"
@@ -557,6 +609,7 @@ start_chatmock() {
     print_info "主机: $host"
     print_info "端口: $port"
     print_info "推理努力: $reasoning_effort"
+    print_info "推理总结: $reasoning_summary"
     print_info "最大连接数: $max_connections"
     print_info "超时时间: $timeout 秒"
     print_info "网络搜索: $enable_web_search"
@@ -568,6 +621,7 @@ start_chatmock() {
     cmd="$cmd --host $host"
     cmd="$cmd --port $port"
     cmd="$cmd --reasoning-effort $reasoning_effort"
+    cmd="$cmd --reasoning-summary $reasoning_summary"
     
     if [ "$enable_web_search" = "true" ]; then
         cmd="$cmd --enable-web-search"

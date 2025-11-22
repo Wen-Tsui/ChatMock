@@ -238,6 +238,7 @@ except:
         local host=$(echo "$config_data" | python3 -c "import sys, json; print(json.load(sys.stdin).get('host', '127.0.0.1'))")
         local port=$(echo "$config_data" | python3 -c "import sys, json; print(json.load(sys.stdin).get('port', 8000))")
         local reasoning=$(echo "$config_data" | python3 -c "import sys, json; print(json.load(sys.stdin).get('reasoning_effort', 'medium'))")
+        local reasoning_summary=$(echo "$config_data" | python3 -c "import sys, json; print(json.load(sys.stdin).get('reasoning_summary', 'auto'))")
         local web_search=$(echo "$config_data" | python3 -c "import sys, json; print(str(json.load(sys.stdin).get('web_search_enabled', False)).lower())")
         
         # 构建启动命令
@@ -245,6 +246,7 @@ except:
         cmd="$cmd --host $host"
         cmd="$cmd --port $port"
         cmd="$cmd --reasoning $reasoning"
+        cmd="$cmd --reasoning-summary $reasoning_summary"
         cmd="$cmd --web-search $web_search"
         cmd="$cmd --verbose"
         
