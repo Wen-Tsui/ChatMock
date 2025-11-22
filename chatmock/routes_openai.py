@@ -24,7 +24,7 @@ openai_bp = Blueprint("openai", __name__)
 
 def _instructions_for_model(model: str) -> str:
     base = current_app.config.get("BASE_INSTRUCTIONS", BASE_INSTRUCTIONS)
-    if model in ("gpt-5-codex", "gpt-5.1-codex", "gpt-5.1-codex-mini"):
+    if model in ("gpt-5-codex", "gpt-5.1-codex", "gpt-5.1-codex-mini", "gpt-5.1-codex-max"):
         codex = current_app.config.get("GPT5_CODEX_INSTRUCTIONS") or GPT5_CODEX_INSTRUCTIONS
         if isinstance(codex, str) and codex.strip():
             return codex
@@ -445,6 +445,7 @@ def list_models() -> Response:
         ("gpt-5-codex", ["high", "medium", "low"]),
         ("gpt-5.1-codex", ["high", "medium", "low"]),
         ("gpt-5.1-codex-mini", ["high", "medium"]),
+        ("gpt-5.1-codex-max", ["xhigh", "high", "medium", "low"]),
         ("codex-mini", []),
     ]
     model_ids: List[str] = []
