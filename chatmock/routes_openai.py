@@ -456,22 +456,23 @@ def completions() -> Response:
 def responses_passthrough() -> Response:
     """
     Direct passthrough endpoint for OpenAI Responses API.
-    
+
     This endpoint receives requests in OpenAI Responses API format and forwards
     them directly to the upstream ChatGPT Responses API without any transformation.
     This enables full compatibility with OpenAI's Responses API and better performance.
     """
     verbose = bool(current_app.config.get("VERBOSE"))
-    
+
+    raw = request.get_data(cache=True, as_text=True) or ""
+    raw_for_upstream = raw
     if verbose:
         try:
-            body_preview = (request.get_data(cache=True, as_text=True) or "")[:2000]
+            body_preview = raw[:2000]
             print("IN POST /v1/responses\n" + body_preview)
         except Exception:
             pass
 
-    # Get the raw request data
-    raw = request.get_data(cache=True, as_text=True) or ""
+    # Minimal inspection: only to ensure valid JSON and to auto-fill instructions when absent/invalid
     try:
         payload = json.loads(raw) if raw else {}
     except Exception:
@@ -480,16 +481,56 @@ def responses_passthrough() -> Response:
         except Exception:
             return jsonify({"error": {"message": "Invalid JSON body"}}), 400
 
-    # Validate that this looks like a Responses API request
     if not isinstance(payload, dict):
         return jsonify({"error": {"message": "Request body must be a JSON object"}}), 400
-    
-    # Check for required fields in Responses API format
-    if not payload.get("model"):
-        return jsonify({"error": {"message": "Missing required field: model"}}), 400
-    
-    if "input" not in payload or payload["input"] is None:
-        return jsonify({"error": {"message": "Missing required field: input"}}), 400
+
+    def _instructions_valid(val: Any) -> bool:
+        if isinstance(val, str):
+            return bool(val.strip())
+        if isinstance(val, list):
+            return len(val) > 0
+        return False
+
+    default_instr = _instructions_for_model(payload.get("model") or "")
+    mutated = False
+    # Always use default instructions; downstream-provided instructions are not supported/ignored
+    payload["instructions"] = default_instr
+    mutated = True
+
+    # Compatibility: drop unsupported params that upstream rejects
+    for _drop_key in ("temperature", "max_output_tokens", "previous_response_id"):
+        if _drop_key in payload:
+            payload.pop(_drop_key, None)
+            mutated = True
+
+    # Compatibility: default store=False if absent
+    # if "store" not in payload:
+    #     payload["store"] = False
+    #     mutated = True
+    payload["store"] = False
+    mutated = True
+
+    # Compatibility: default stream=True if absent
+    if "stream" not in payload:
+        payload["stream"] = True
+        mutated = True
+
+    # Compatibility: allow simple string input and normalize to Responses item list
+    if isinstance(payload.get("input"), str):
+        payload["input"] = [
+            {
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": payload["input"]}],
+            }
+        ]
+        mutated = True
+
+    if mutated:
+        try:
+            raw_for_upstream = json.dumps(payload, ensure_ascii=False)
+        except Exception:
+            raw_for_upstream = raw  # fallback; should not happen
 
     # Get authentication
     access_token, account_id = get_effective_chatgpt_auth()
@@ -508,31 +549,27 @@ def responses_passthrough() -> Response:
             resp.headers.setdefault(k, v)
         return resp
 
-    # Ensure the payload has stream=True for real-time responses
-    if "stream" not in payload:
-        payload["stream"] = True
+    upstream_headers: Dict[str, str] = {}
+    try:
+        content_type = request.headers.get("Content-Type")
+        accept = request.headers.get("Accept")
+        openai_beta = request.headers.get("OpenAI-Beta")
+    except Exception:
+        content_type = accept = openai_beta = None
 
-    # Ensure instructions are present; some upstream deployments require it
-    instr = payload.get("instructions")
-    if not (isinstance(instr, str) and instr.strip()):
-        payload["instructions"] = _instructions_for_model(payload.get("model") or "")
+    if content_type:
+        upstream_headers["Content-Type"] = content_type
+    if accept:
+        upstream_headers["Accept"] = accept
+    if openai_beta:
+        upstream_headers["OpenAI-Beta"] = openai_beta
 
-    # Some upstream deployments require store=False explicitly
-    if "store" not in payload:
-        payload["store"] = False
+    upstream_headers.setdefault("Content-Type", "application/json")
+    upstream_headers.setdefault("Accept", "text/event-stream")
+    upstream_headers.setdefault("OpenAI-Beta", "responses=v1")
+    upstream_headers["Authorization"] = f"Bearer {access_token}"
+    upstream_headers["chatgpt-account-id"] = account_id
 
-    # Normalize simple string input to Responses API list format
-    # Upstream requires list items even for single text queries
-    if isinstance(payload.get("input"), str):
-        payload["input"] = [
-            {
-                "type": "message",
-                "role": "user",
-                "content": [{"type": "input_text", "text": payload["input"]}],
-            }
-        ]
-
-    # Add session management if available
     client_session_id = None
     try:
         client_session_id = (
@@ -542,44 +579,21 @@ def responses_passthrough() -> Response:
         )
     except Exception:
         client_session_id = None
-    
-    if client_session_id:
-        payload["prompt_cache_key"] = client_session_id
 
-    # Prepare headers for upstream request
-    beta_flags = ["responses=v1"]
-    try:
-        for _tool in payload.get("tools") or []:
-            if not isinstance(_tool, dict):
-                continue
-            if _tool.get("type") in ("web_search", "web_search_preview"):
-                if "web-search=v1" not in beta_flags:
-                    beta_flags.append("web-search=v1")
-    except Exception:
-        pass
-
-    headers = {
-        "Authorization": f"Bearer {access_token}",
-        "Content-Type": "application/json",
-        "Accept": "text/event-stream",
-        "chatgpt-account-id": account_id,
-        "OpenAI-Beta": ",".join(beta_flags),
-    }
-    
     if client_session_id:
-        headers["session_id"] = client_session_id
+        upstream_headers["session_id"] = client_session_id
 
     request_timeout = 1800
     request_ctx = {
         "url": CHATGPT_RESPONSES_URL,
-        "payload": deepcopy(payload),
-        "headers": dict(headers),
+        "payload": raw_for_upstream,
+        "headers": dict(upstream_headers),
         "timeout": request_timeout,
     }
 
     if verbose:
         try:
-            safe_headers = dict(headers)
+            safe_headers = dict(upstream_headers)
             if "Authorization" in safe_headers:
                 safe_headers["Authorization"] = "Bearer ***"
             print(
@@ -588,7 +602,6 @@ def responses_passthrough() -> Response:
                     {
                         "url": CHATGPT_RESPONSES_URL,
                         "headers": safe_headers,
-                        "payload": payload,
                         "stream": True,
                         "timeout": request_timeout,
                     }
@@ -600,8 +613,8 @@ def responses_passthrough() -> Response:
     try:
         upstream = requests.post(
             CHATGPT_RESPONSES_URL,
-            headers=headers,
-            json=payload,
+            headers=upstream_headers,
+            data=raw_for_upstream.encode("utf-8"),
             stream=True,
             timeout=request_timeout,
         )
@@ -613,7 +626,8 @@ def responses_passthrough() -> Response:
 
     record_rate_limits_from_response(upstream)
 
-    # Handle error responses
+    setattr(upstream, "_chatmock_request_ctx", request_ctx)
+
     if upstream.status_code >= 400:
         if verbose:
             try:
@@ -625,75 +639,100 @@ def responses_passthrough() -> Response:
                 )
             except Exception:
                 pass
+        body_bytes = upstream.content or b""
+        detail = None
         try:
-            raw_error = upstream.content
-            err_body = json.loads(raw_error.decode("utf-8", errors="ignore")) if raw_error else {"raw": upstream.text}
+            err_json = json.loads(body_bytes.decode("utf-8", errors="ignore")) if body_bytes else {}
+            detail = err_json.get("detail")
         except Exception:
-            err_body = {"raw": upstream.text}
-        
-        error_message = (err_body.get("error", {}) or {}).get("message", "Upstream error")
-        resp = make_response(jsonify({"error": {"message": error_message}}), upstream.status_code)
-        for k, v in build_cors_headers().items():
-            resp.headers.setdefault(k, v)
-        return resp
+            err_json = None
 
-    # Handle streaming response
-    is_stream = bool(payload.get("stream", False))
-    if is_stream:
-        # For streaming responses, pass through the SSE stream directly
-        def generate():
-            try:
-                for chunk in upstream.iter_content(chunk_size=1024, decode_unicode=False):
-                    if chunk:
-                        yield chunk
-            finally:
-                upstream.close()
-        
-        resp = Response(
-            generate(),
-            status=upstream.status_code,
-            mimetype="text/event-stream",
-            headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
+        retry_for_instructions = (
+            isinstance(detail, str)
+            and "instruction" in detail.lower()
+            and isinstance(default_instr, str)
+            and bool(default_instr.strip())
         )
-        for k, v in build_cors_headers().items():
-            resp.headers.setdefault(k, v)
-        return resp
-
-    # For non-streaming responses, collect the full response
-    full_response = {"response": {"id": "resp_passthrough"}}
-    try:
-        for raw_line in upstream.iter_lines(decode_unicode=False):
-            if not raw_line:
-                continue
-            line = raw_line.decode("utf-8", errors="ignore") if isinstance(raw_line, (bytes, bytearray)) else raw_line
-            if not line.startswith("data: "):
-                continue
-            data = line[len("data: "):].strip()
-            if not data or data == "[DONE]":
-                if data == "[DONE]":
-                    break
-                continue
+        if retry_for_instructions:
+            fallback_payload = payload.copy()
+            fallback_payload["instructions"] = default_instr
             try:
-                evt = json.loads(data)
+                fallback_raw = json.dumps(fallback_payload, ensure_ascii=False)
             except Exception:
-                continue
-            
-            # Parse the Responses API format
-            if evt.get("type") == "response.completed":
-                if isinstance(evt.get("response"), dict):
-                    full_response = evt["response"]
-                break
-            elif evt.get("type") == "response.failed":
-                error_msg = evt.get("response", {}).get("error", {}).get("message", "Response failed")
-                resp = make_response(jsonify({"error": {"message": error_msg}}), 502)
+                fallback_raw = None
+
+            if fallback_raw:
+                try:
+                    upstream_retry = requests.post(
+                        CHATGPT_RESPONSES_URL,
+                        headers=upstream_headers,
+                        data=fallback_raw.encode("utf-8"),
+                        stream=True,
+                        timeout=request_timeout,
+                    )
+                except requests.RequestException:
+                    upstream_retry = None
+
+                upstream.close()
+
+                if upstream_retry is not None:
+                    record_rate_limits_from_response(upstream_retry)
+                    if upstream_retry.status_code < 400:
+                        upstream = upstream_retry
+                        raw_for_upstream = fallback_raw
+                        request_ctx["payload"] = fallback_raw
+                        setattr(upstream, "_chatmock_request_ctx", request_ctx)
+                    else:
+                        body_bytes = upstream_retry.content or b""
+                        content_type = upstream_retry.headers.get("Content-Type")
+                        resp = Response(body_bytes, status=upstream_retry.status_code)
+                        if content_type:
+                            resp.headers.setdefault("Content-Type", content_type)
+                        for k, v in build_cors_headers().items():
+                            resp.headers.setdefault(k, v)
+                        upstream_retry.close()
+                        return resp
+                else:
+                    resp = Response(body_bytes, status=upstream.status_code)
+                    content_type = upstream.headers.get("Content-Type")
+                    if content_type:
+                        resp.headers.setdefault("Content-Type", content_type)
+                    for k, v in build_cors_headers().items():
+                        resp.headers.setdefault(k, v)
+                    return resp
+            else:
+                resp = Response(body_bytes, status=upstream.status_code)
+                content_type = upstream.headers.get("Content-Type")
+                if content_type:
+                    resp.headers.setdefault("Content-Type", content_type)
                 for k, v in build_cors_headers().items():
                     resp.headers.setdefault(k, v)
+                upstream.close()
                 return resp
-    finally:
-        upstream.close()
+        else:
+            resp = Response(body_bytes, status=upstream.status_code)
+            content_type = upstream.headers.get("Content-Type")
+            if content_type:
+                resp.headers.setdefault("Content-Type", content_type)
+            for k, v in build_cors_headers().items():
+                resp.headers.setdefault(k, v)
+            upstream.close()
+            return resp
 
-    # Return the response in Responses API format
-    resp = make_response(jsonify(full_response), upstream.status_code)
+    def generate():
+        try:
+            for chunk in upstream.iter_content(chunk_size=1024, decode_unicode=False):
+                if chunk:
+                    yield chunk
+        finally:
+            upstream.close()
+
+    resp = Response(generate(), status=upstream.status_code)
+    content_type = upstream.headers.get("Content-Type")
+    if content_type:
+        resp.headers.setdefault("Content-Type", content_type)
+    resp.headers.setdefault("Cache-Control", "no-cache")
+    resp.headers.setdefault("Connection", "keep-alive")
     for k, v in build_cors_headers().items():
         resp.headers.setdefault(k, v)
     return resp
