@@ -126,7 +126,7 @@ def start_upstream_request(
         "Content-Type": "application/json",
         "Accept": "text/event-stream",
         "chatgpt-account-id": account_id,
-        "OpenAI-Beta": "responses=experimental",
+        "OpenAI-Beta": "responses=v1",
         "session_id": session_id,
     }
 

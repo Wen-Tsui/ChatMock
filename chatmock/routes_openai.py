@@ -3,19 +3,23 @@ from __future__ import annotations
 import json
 import time
 from typing import Any, Dict, List
+from copy import deepcopy
 
+import requests
 from flask import Blueprint, Response, current_app, jsonify, make_response, request
 
-from .config import BASE_INSTRUCTIONS, GPT5_CODEX_INSTRUCTIONS
+from .config import BASE_INSTRUCTIONS, GPT5_CODEX_INSTRUCTIONS, CHATGPT_RESPONSES_URL
 from .limits import record_rate_limits_from_response
 from .http import build_cors_headers
 from .reasoning import apply_reasoning_to_message, build_reasoning_param, extract_reasoning_from_model_name
+from .session import ensure_session_id
 from .upstream import normalize_model_name, start_upstream_request
 from .utils import (
     convert_chat_messages_to_responses_input,
     convert_tools_chat_to_responses,
     sse_translate_chat,
     sse_translate_text,
+    get_effective_chatgpt_auth,
 )
 
 
@@ -145,6 +149,18 @@ def chat_completions() -> Response:
         return error_resp
 
     record_rate_limits_from_response(upstream)
+    if verbose:
+        try:
+            print(
+                "[Passthrough] Upstream status",
+                upstream.status_code,
+                "stream?",
+                bool(payload.get("stream", False)),
+                "headers",
+                {k: v for k, v in list(upstream.headers.items())[:20]},
+            )
+        except Exception:
+            pass
 
     created = int(time.time())
     if upstream.status_code >= 400:
@@ -436,6 +452,253 @@ def completions() -> Response:
     return resp
 
 
+@openai_bp.route("/v1/responses", methods=["POST"])
+def responses_passthrough() -> Response:
+    """
+    Direct passthrough endpoint for OpenAI Responses API.
+    
+    This endpoint receives requests in OpenAI Responses API format and forwards
+    them directly to the upstream ChatGPT Responses API without any transformation.
+    This enables full compatibility with OpenAI's Responses API and better performance.
+    """
+    verbose = bool(current_app.config.get("VERBOSE"))
+    
+    if verbose:
+        try:
+            body_preview = (request.get_data(cache=True, as_text=True) or "")[:2000]
+            print("IN POST /v1/responses\n" + body_preview)
+        except Exception:
+            pass
+
+    # Get the raw request data
+    raw = request.get_data(cache=True, as_text=True) or ""
+    try:
+        payload = json.loads(raw) if raw else {}
+    except Exception:
+        try:
+            payload = json.loads(raw.replace("\r", "").replace("\n", ""))
+        except Exception:
+            return jsonify({"error": {"message": "Invalid JSON body"}}), 400
+
+    # Validate that this looks like a Responses API request
+    if not isinstance(payload, dict):
+        return jsonify({"error": {"message": "Request body must be a JSON object"}}), 400
+    
+    # Check for required fields in Responses API format
+    if not payload.get("model"):
+        return jsonify({"error": {"message": "Missing required field: model"}}), 400
+    
+    if "input" not in payload or payload["input"] is None:
+        return jsonify({"error": {"message": "Missing required field: input"}}), 400
+
+    # Get authentication
+    access_token, account_id = get_effective_chatgpt_auth()
+    if not access_token or not account_id:
+        resp = make_response(
+            jsonify(
+                {
+                    "error": {
+                        "message": "Missing ChatGPT credentials. Run 'python3 chatmock.py login' first.",
+                    }
+                }
+            ),
+            401,
+        )
+        for k, v in build_cors_headers().items():
+            resp.headers.setdefault(k, v)
+        return resp
+
+    # Ensure the payload has stream=True for real-time responses
+    if "stream" not in payload:
+        payload["stream"] = True
+
+    # Ensure instructions are present; some upstream deployments require it
+    instr = payload.get("instructions")
+    if not (isinstance(instr, str) and instr.strip()):
+        payload["instructions"] = _instructions_for_model(payload.get("model") or "")
+
+    # Some upstream deployments require store=False explicitly
+    if "store" not in payload:
+        payload["store"] = False
+
+    # Normalize simple string input to Responses API list format
+    # Upstream requires list items even for single text queries
+    if isinstance(payload.get("input"), str):
+        payload["input"] = [
+            {
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": payload["input"]}],
+            }
+        ]
+
+    # Add session management if available
+    client_session_id = None
+    try:
+        client_session_id = (
+            request.headers.get("X-Session-Id")
+            or request.headers.get("session_id")
+            or None
+        )
+    except Exception:
+        client_session_id = None
+    
+    if client_session_id:
+        payload["prompt_cache_key"] = client_session_id
+
+    # Prepare headers for upstream request
+    beta_flags = ["responses=v1"]
+    try:
+        for _tool in payload.get("tools") or []:
+            if not isinstance(_tool, dict):
+                continue
+            if _tool.get("type") in ("web_search", "web_search_preview"):
+                if "web-search=v1" not in beta_flags:
+                    beta_flags.append("web-search=v1")
+    except Exception:
+        pass
+
+    headers = {
+        "Authorization": f"Bearer {access_token}",
+        "Content-Type": "application/json",
+        "Accept": "text/event-stream",
+        "chatgpt-account-id": account_id,
+        "OpenAI-Beta": ",".join(beta_flags),
+    }
+    
+    if client_session_id:
+        headers["session_id"] = client_session_id
+
+    request_timeout = 1800
+    request_ctx = {
+        "url": CHATGPT_RESPONSES_URL,
+        "payload": deepcopy(payload),
+        "headers": dict(headers),
+        "timeout": request_timeout,
+    }
+
+    if verbose:
+        try:
+            safe_headers = dict(headers)
+            if "Authorization" in safe_headers:
+                safe_headers["Authorization"] = "Bearer ***"
+            print(
+                "[Passthrough] Upstream request",
+                json.dumps(
+                    {
+                        "url": CHATGPT_RESPONSES_URL,
+                        "headers": safe_headers,
+                        "payload": payload,
+                        "stream": True,
+                        "timeout": request_timeout,
+                    }
+                )[:4000],
+            )
+        except Exception:
+            pass
+
+    try:
+        upstream = requests.post(
+            CHATGPT_RESPONSES_URL,
+            headers=headers,
+            json=payload,
+            stream=True,
+            timeout=request_timeout,
+        )
+    except requests.RequestException as e:
+        resp = make_response(jsonify({"error": {"message": f"Upstream ChatGPT request failed: {e}"}}), 502)
+        for k, v in build_cors_headers().items():
+            resp.headers.setdefault(k, v)
+        return resp
+
+    record_rate_limits_from_response(upstream)
+
+    # Handle error responses
+    if upstream.status_code >= 400:
+        if verbose:
+            try:
+                print(
+                    "[Passthrough] Upstream error status",
+                    upstream.status_code,
+                    "body-preview",
+                    (upstream.text or "")[:2000],
+                )
+            except Exception:
+                pass
+        try:
+            raw_error = upstream.content
+            err_body = json.loads(raw_error.decode("utf-8", errors="ignore")) if raw_error else {"raw": upstream.text}
+        except Exception:
+            err_body = {"raw": upstream.text}
+        
+        error_message = (err_body.get("error", {}) or {}).get("message", "Upstream error")
+        resp = make_response(jsonify({"error": {"message": error_message}}), upstream.status_code)
+        for k, v in build_cors_headers().items():
+            resp.headers.setdefault(k, v)
+        return resp
+
+    # Handle streaming response
+    is_stream = bool(payload.get("stream", False))
+    if is_stream:
+        # For streaming responses, pass through the SSE stream directly
+        def generate():
+            try:
+                for chunk in upstream.iter_content(chunk_size=1024, decode_unicode=False):
+                    if chunk:
+                        yield chunk
+            finally:
+                upstream.close()
+        
+        resp = Response(
+            generate(),
+            status=upstream.status_code,
+            mimetype="text/event-stream",
+            headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
+        )
+        for k, v in build_cors_headers().items():
+            resp.headers.setdefault(k, v)
+        return resp
+
+    # For non-streaming responses, collect the full response
+    full_response = {"response": {"id": "resp_passthrough"}}
+    try:
+        for raw_line in upstream.iter_lines(decode_unicode=False):
+            if not raw_line:
+                continue
+            line = raw_line.decode("utf-8", errors="ignore") if isinstance(raw_line, (bytes, bytearray)) else raw_line
+            if not line.startswith("data: "):
+                continue
+            data = line[len("data: "):].strip()
+            if not data or data == "[DONE]":
+                if data == "[DONE]":
+                    break
+                continue
+            try:
+                evt = json.loads(data)
+            except Exception:
+                continue
+            
+            # Parse the Responses API format
+            if evt.get("type") == "response.completed":
+                if isinstance(evt.get("response"), dict):
+                    full_response = evt["response"]
+                break
+            elif evt.get("type") == "response.failed":
+                error_msg = evt.get("response", {}).get("error", {}).get("message", "Response failed")
+                resp = make_response(jsonify({"error": {"message": error_msg}}), 502)
+                for k, v in build_cors_headers().items():
+                    resp.headers.setdefault(k, v)
+                return resp
+    finally:
+        upstream.close()
+
+    # Return the response in Responses API format
+    resp = make_response(jsonify(full_response), upstream.status_code)
+    for k, v in build_cors_headers().items():
+        resp.headers.setdefault(k, v)
+    return resp
+
+
 @openai_bp.route("/v1/models", methods=["GET"])
 def list_models() -> Response:
     expose_variants = bool(current_app.config.get("EXPOSE_REASONING_MODELS"))
@@ -459,4 +722,3 @@ def list_models() -> Response:
     for k, v in build_cors_headers().items():
         resp.headers.setdefault(k, v)
     return resp
-
