@@ -755,7 +755,7 @@ python3 chatmock.py serve --port 8080
 ### 推理和思维参数
 - `enable_thinking`: 启用思维链显示
 - `thinking_budget`: 思维链最大 token 数
-- `reasoning_effort`: 推理努力级别 (high/medium/low/minimal)
+- `reasoning_effort`: 推理努力级别 (xhigh/high/medium/low/minimal)
 - `reasoning`: OpenRouter 推理配置
 - `thinking`: Zai provider 思维配置
 

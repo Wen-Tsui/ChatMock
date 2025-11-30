@@ -121,7 +121,7 @@ curl http://127.0.0.1:8000/v1/chat/completions \
 
 ### Thinking effort
 
-- `--reasoning-effort` (choice of minimal,low,medium,high)<br>
+- `--reasoning-effort` (choice of minimal,low,medium,high,xhigh)<br>
 GPT-5 has a configurable amount of "effort" it can put into thinking, which may cause it to take more time for a response to return, but may overall give a smarter answer. Applying this parameter after `serve` forces the server to use this reasoning effort by default, unless overrided by the API request with a different effort set. The default reasoning effort without setting this parameter is `medium`.
 
 ### Thinking summaries
@@ -165,7 +165,6 @@ When the model returns a thinking summary, the model will send back thinking tag
 ## Star History
 
 [![Star History Chart](https://api.star-history.com/svg?repos=RayBytes/ChatMock&type=Timeline)](https://www.star-history.com/#RayBytes/ChatMock&Timeline)
-
 
 
 
